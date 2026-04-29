@@ -1,0 +1,18 @@
+[package]
+name = "symphony-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+symphony-core = { path = "../symphony-core" }
+symphony-config = { path = "../symphony-config" }
+symphony-codex = { path = "../symphony-codex" }
+symphony-tracker = { path = "../symphony-tracker" }
+symphony-tracker-linear = { path = "../symphony-tracker-linear" }
+symphony-workflow = { path = "../symphony-workflow" }
+symphony-workspace = { path = "../symphony-workspace" }

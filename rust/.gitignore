@@ -1,0 +1,24 @@
+# Cargo build output
+debug/
+target/
+
+# Backup files from rustfmt
+**/*.rs.bk
+
+# MSVC Windows debug symbols
+*.pdb
+
+# Profiling and coverage (cargo-flamegraph, llvm-cov, tarpaulin, etc.)
+*.profdata
+*.profraw
+coverage/
+lcov.info
+tarpaulin-report.html
+
+# fuzz (cargo-fuzz)
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/coverage/
+
+# Optional: uncomment if this repo is a library and you do not want to lock dependency versions
+# Cargo.lock
