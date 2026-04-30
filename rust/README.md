@@ -25,6 +25,7 @@ Implemented:
 - Workspace lifecycle primitives and hook execution
 - Tracker trait and Linear GraphQL adapter scaffold
 - Codex app-server process + JSON message loop baseline
+- Dual runtime interface selection (`codex` default, optional `cursor_cli` translation path)
 - Core orchestrator dispatch/retry/token bookkeeping baseline
 - Unit tests covering major primitives
 
@@ -143,6 +144,8 @@ Current typed settings tree (from `symphony-config`):
 - `codex.command` (non-empty)
 - `codex.turn_timeout_ms` (total turn stream timeout, default `900000`)
 - `codex.stall_timeout_ms`
+- `codex.detailed_app_server_logs` (default `false`; when true, logs full app-server message payloads)
+- `runtime.interface` (`codex` default, or `cursor_cli`)
 - `tracker.kind`
 - `tracker.endpoint` / `tracker.token` / `tracker.project`
 
@@ -221,6 +224,23 @@ Current recommended environment variables for workflow front matter:
   - `threadId`, `turnId`
   - usage token payloads when present
 - Stall timeout boundary
+
+### Runtime Interface Selection
+
+Symphony supports two runtime interfaces:
+
+- `runtime.interface: codex` (default): existing Codex app-server JSON-RPC path.
+- `runtime.interface: cursor_cli`: an in-process translation app-server path that keeps the same
+  Symphony-side contract and bridges to Cursor CLI stream-json output.
+
+Example front matter:
+
+```yaml
+runtime:
+  interface: cursor_cli
+codex:
+  command: cursor-agent -p --output-format stream-json
+```
 
 ### Optional Extension: `linear_graphql` Client-Side Tool
 

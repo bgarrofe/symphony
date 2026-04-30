@@ -1,11 +1,12 @@
 use chrono::{DateTime, Utc};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use thiserror::Error;
 use tokio::time::{Duration, Instant};
 use tracing::{error, info};
 
-use symphony_codex::{CodexClient, DynamicToolContext, LinearGraphqlTool};
+use symphony_codex::{CodexClient, CursorCliClient, DynamicToolContext, LinearGraphqlTool};
 use symphony_config::Settings;
 use symphony_tracker::{Issue, Tracker, TrackerError};
 use symphony_workflow::{PromptContext, WorkflowStore};
@@ -207,7 +208,7 @@ impl<T: Tracker> Orchestrator<T> {
             },
         );
 
-        let rendered = self
+        let mut rendered = self
             .workflow_store
             .current()
             .render(&PromptContext {
@@ -216,10 +217,38 @@ impl<T: Tracker> Orchestrator<T> {
             })
             .map_err(|e| CoreError::Workflow(e.to_string()))?;
 
-        let mut client = CodexClient::spawn(&self.settings.codex.command, &workspace_path)
-            .await
-            .map_err(|e| CoreError::Runtime(e.to_string()))?;
-        info!(issue=%issue.identifier, "codex process spawned");
+        // Cursor CLI does not support dynamic tool injection in the same way as Codex
+        // app-server. Provide a workspace-local helper command for linear_graphql access.
+        if self
+            .settings
+            .runtime
+            .interface
+            .eq_ignore_ascii_case("cursor_cli")
+        {
+            if let (Some(endpoint), Some(token)) = (
+                self.settings.tracker.endpoint.as_deref(),
+                self.settings.tracker.token.as_deref(),
+            ) {
+                if !endpoint.is_empty() && !token.is_empty() {
+                    let helper_path = workspace_path.join("linear_graphql");
+                    let helper = render_linear_graphql_helper(endpoint, token);
+                    tokio::fs::write(&helper_path, helper)
+                        .await
+                        .map_err(|e| CoreError::Runtime(e.to_string()))?;
+                    tokio::fs::set_permissions(
+                        &helper_path,
+                        std::fs::Permissions::from_mode(0o700),
+                    )
+                    .await
+                    .map_err(|e| CoreError::Runtime(e.to_string()))?;
+                    rendered.push_str(
+                        "\n\nRuntime note: `linear_graphql` is available as an executable in the current workspace. Use it for Linear GraphQL calls when needed.\nUsage: `./linear_graphql '<query>' '{\"variables\":{...}}'`\n",
+                    );
+                    info!(path=%helper_path.display(), "cursor cli linear_graphql helper provisioned");
+                }
+            }
+        }
+
         let tool_context = DynamicToolContext {
             linear_graphql: if self.settings.tracker.kind.eq_ignore_ascii_case("linear") {
                 match (
@@ -235,15 +264,47 @@ impl<T: Tracker> Orchestrator<T> {
                 None
             },
         };
-        let turn = client
-            .initialize(
-                &rendered,
-                self.settings.codex.turn_timeout_ms,
-                self.settings.codex.stall_timeout_ms,
-                tool_context,
-            )
-            .await
-            .map_err(|e| CoreError::Runtime(e.to_string()))?;
+        let turn = if self
+            .settings
+            .runtime
+            .interface
+            .eq_ignore_ascii_case("cursor_cli")
+        {
+            let mut client =
+                CursorCliClient::spawn(&self.settings.codex.command, &rendered, &workspace_path)
+                    .await
+                    .map_err(|e| CoreError::Runtime(e.to_string()))?;
+            info!(issue=%issue.identifier, runtime="cursor_cli", "cursor cli process spawned");
+            let turn = client
+                .initialize(
+                    &rendered,
+                    self.settings.codex.turn_timeout_ms,
+                    self.settings.codex.stall_timeout_ms,
+                    tool_context.clone(),
+                    self.settings.codex.detailed_app_server_logs,
+                )
+                .await
+                .map_err(|e| CoreError::Runtime(e.to_string()))?;
+            let _ = client.kill().await;
+            turn
+        } else {
+            let mut client = CodexClient::spawn(&self.settings.codex.command, &workspace_path)
+                .await
+                .map_err(|e| CoreError::Runtime(e.to_string()))?;
+            info!(issue=%issue.identifier, runtime="codex", "codex process spawned");
+            let turn = client
+                .initialize(
+                    &rendered,
+                    self.settings.codex.turn_timeout_ms,
+                    self.settings.codex.stall_timeout_ms,
+                    tool_context,
+                    self.settings.codex.detailed_app_server_logs,
+                )
+                .await
+                .map_err(|e| CoreError::Runtime(e.to_string()))?;
+            let _ = client.kill().await;
+            turn
+        };
         info!(
             issue=%issue.identifier,
             status=%turn.status,
@@ -254,7 +315,6 @@ impl<T: Tracker> Orchestrator<T> {
         if let Some(usage) = turn.usage {
             self.total_tokens = self.total_tokens.saturating_add(usage.total_tokens);
         }
-        let _ = client.kill().await;
 
         if let Some(cmd) = hooks.after_run.as_deref() {
             let _ = run_hook("after_run", cmd, &workspace_path, hooks.timeout_ms, false).await;
@@ -263,6 +323,45 @@ impl<T: Tracker> Orchestrator<T> {
         info!(issue=%issue.identifier, "issue run completed");
         Ok(())
     }
+}
+
+fn render_linear_graphql_helper(endpoint: &str, token: &str) -> String {
+    format!(
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+QUERY="${{1:-}}"
+VARS="${{2:-{{}}}}"
+if [[ -z "$QUERY" ]]; then
+  echo "usage: ./linear_graphql '<query>' '{{\"variables\":{{...}}}}'" >&2
+  exit 1
+fi
+python3 - "$QUERY" "$VARS" <<'PY'
+import json
+import sys
+import urllib.request
+
+query = sys.argv[1]
+vars_raw = sys.argv[2]
+try:
+    variables = json.loads(vars_raw)
+except Exception:
+    variables = {{}}
+
+payload = json.dumps({{"query": query, "variables": variables}}).encode("utf-8")
+req = urllib.request.Request(
+    "{endpoint}",
+    data=payload,
+    headers={{
+        "Authorization": "Bearer {token}",
+        "Content-Type": "application/json",
+    }},
+    method="POST",
+)
+with urllib.request.urlopen(req) as resp:
+    sys.stdout.write(resp.read().decode("utf-8"))
+PY
+"#
+    )
 }
 
 pub fn sort_candidates(candidates: &mut [Issue]) {

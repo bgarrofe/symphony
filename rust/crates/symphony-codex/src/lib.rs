@@ -143,6 +143,10 @@ pub struct CodexClient {
     child: Child,
 }
 
+pub struct CursorCliClient {
+    child: Child,
+}
+
 impl CodexClient {
     pub async fn spawn(command: &str, cwd: &std::path::Path) -> Result<Self, CodexError> {
         let child = Command::new("bash")
@@ -163,6 +167,7 @@ impl CodexClient {
         turn_timeout_ms: u64,
         stall_timeout_ms: u64,
         tool_context: DynamicToolContext,
+        detailed_app_server_logs: bool,
     ) -> Result<TurnOutcome, CodexError> {
         let mut stdin = self.child.stdin.take().ok_or(CodexError::MissingIo)?;
         info!("codex initialize: sending initialize request");
@@ -228,6 +233,11 @@ impl CodexClient {
                     debug!("codex stream non-json line ignored");
                     continue;
                 };
+                if detailed_app_server_logs {
+                    let raw = serde_json::to_string(&value).unwrap_or_else(|_| line.clone());
+                    let preview: String = raw.chars().take(2000).collect();
+                    info!(message=%preview, "codex protocol: inbound app-server message");
+                }
                 if let Some(method) = value.get("method").and_then(Value::as_str) {
                     debug!(method=%method, "codex protocol method");
                 } else if let Some(id) = value.get("id") {
@@ -312,12 +322,199 @@ impl CodexClient {
     }
 }
 
+impl CursorCliClient {
+    pub async fn spawn(
+        command: &str,
+        prompt: &str,
+        cwd: &std::path::Path,
+    ) -> Result<Self, CodexError> {
+        let full_command = format!("{command} {}", shell_quote_single(prompt));
+        let log_command = format!("{command} <WORKFLOW.md>");
+        info!(command=%log_command, cwd=%cwd.display(), "cursor translation: launching cursor cli command");
+        let child = Command::new("bash")
+            .arg("-lc")
+            .arg(&full_command)
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(CodexError::Spawn)?;
+        Ok(Self { child })
+    }
+
+    pub async fn initialize(
+        &mut self,
+        _input_prompt: &str,
+        turn_timeout_ms: u64,
+        stall_timeout_ms: u64,
+        tool_context: DynamicToolContext,
+        detailed_app_server_logs: bool,
+    ) -> Result<TurnOutcome, CodexError> {
+        let mut stdin = self.child.stdin.take().ok_or(CodexError::MissingIo)?;
+        if let Some(stderr) = self.child.stderr.take() {
+            tokio::spawn(async move {
+                let mut stderr_lines = BufReader::new(stderr).lines();
+                loop {
+                    match stderr_lines.next_line().await {
+                        Ok(Some(line)) => {
+                            if !line.trim().is_empty() {
+                                info!(line=%line, "cursor translation: child stderr");
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(err) => {
+                            info!(error=%err, "cursor translation: stderr read failed");
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+        // Prompt is provided as a launch argument. stdin remains available for
+        // interactive protocol replies (tool results/approvals) if requested.
+        info!("cursor translation: outbound turn/start (prompt provided as launch argument)");
+
+        let stdout = self.child.stdout.take().ok_or(CodexError::MissingIo)?;
+        let mut reader = BufReader::new(stdout).lines();
+        let mut outcome = TurnOutcome {
+            status: "unknown".to_string(),
+            usage: None,
+            thread_id: None,
+            turn_id: None,
+        };
+
+        timeout(Duration::from_millis(turn_timeout_ms), async {
+            let stall = Duration::from_millis(stall_timeout_ms);
+            let started = Instant::now();
+            let mut saw_any_event = false;
+            loop {
+                let next = match timeout(stall, reader.next_line()).await {
+                    Ok(result) => result.map_err(CodexError::Io)?,
+                    Err(_) => {
+                        info!(
+                            stall_timeout_ms,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "cursor translation: stall timeout waiting for stdout"
+                        );
+                        return Err(CodexError::StallTimeout);
+                    }
+                };
+                let Some(line) = next else {
+                    info!("cursor translation: stream reached EOF");
+                    break;
+                };
+                if line.trim().is_empty() {
+                    continue;
+                }
+                saw_any_event = true;
+                let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                    if detailed_app_server_logs {
+                        let preview: String = line.chars().take(240).collect();
+                        info!(line=%preview, "cursor translation: inbound non-json line");
+                    } else {
+                        info!("cursor translation: inbound non-json line");
+                    }
+                    continue;
+                };
+                if detailed_app_server_logs {
+                    let raw_message = serde_json::to_string(&value).unwrap_or_else(|_| line.clone());
+                    let raw_preview: String = raw_message.chars().take(2000).collect();
+                    info!(message=%raw_preview, "cursor translation: inbound app-server message");
+                }
+                if let Some(method) = value.get("method").and_then(Value::as_str) {
+                    info!(method=%method, "cursor translation: inbound rpc message");
+                } else if let Some(event_type) = value.get("type").and_then(Value::as_str) {
+                    info!(event_type=%event_type, "cursor translation: inbound stream event");
+                } else if let Some(id) = value.get("id") {
+                    info!(id=%id, "cursor translation: inbound rpc response");
+                }
+                debug!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "cursor stream message received"
+                );
+
+                if let Some(tool_call_id) = maybe_tool_call_id(&value) {
+                    let result = match extract_tool_call(&value) {
+                        Some((tool_name, arguments)) => {
+                            execute_tool_call(&tool_context, &tool_name, arguments).await
+                        }
+                        None => failure_payload("invalid tool call payload"),
+                    };
+                    let response = json!({"id": tool_call_id.clone(), "result": result});
+                    let serialized =
+                        serde_json::to_string(&response).map_err(CodexError::Serialize)?;
+                    stdin
+                        .write_all(format!("{serialized}\n").as_bytes())
+                        .await
+                        .map_err(CodexError::Io)?;
+                    info!(id=%tool_call_id, "cursor translation: outbound tool call result");
+                    continue;
+                }
+                if let Some((approval_id, decision)) = maybe_auto_approval_request(&value) {
+                    let response = json!({"id": approval_id.clone(), "result": {"decision": decision}});
+                    let serialized =
+                        serde_json::to_string(&response).map_err(CodexError::Serialize)?;
+                    stdin
+                        .write_all(format!("{serialized}\n").as_bytes())
+                        .await
+                        .map_err(CodexError::Io)?;
+                    info!(id=%approval_id, decision=%decision, "cursor translation: outbound approval decision");
+                    continue;
+                }
+                if let Some(err) = maybe_protocol_error(&value) {
+                    return Err(CodexError::ResponseError(err));
+                }
+
+                let previous_status = outcome.status.clone();
+                apply_cursor_translated_message(&value, &mut outcome);
+                if previous_status != outcome.status {
+                    info!(status=%outcome.status, "cursor translation: mapped turn status updated");
+                }
+            }
+            if !saw_any_event {
+                return Err(CodexError::ResponseError(
+                    "cursor stream closed without events".to_string(),
+                ));
+            }
+            if outcome.status == "unknown" || outcome.status == "in_progress" {
+                outcome.status = "completed".to_string();
+                info!(status=%outcome.status, "cursor translation: synthesized terminal status");
+            }
+            match self.child.try_wait() {
+                Ok(Some(status)) => info!(exit_status=%status, "cursor translation: child process exited"),
+                Ok(None) => info!("cursor translation: child process still running after stream"),
+                Err(err) => info!(error=%err, "cursor translation: failed to query child exit status"),
+            }
+            Ok::<(), CodexError>(())
+        })
+        .await
+        .map_err(|_| {
+            info!(
+                turn_timeout_ms,
+                "cursor translation: total turn timeout elapsed"
+            );
+            CodexError::Timeout
+        })??;
+
+        Ok(outcome)
+    }
+
+    pub async fn kill(&mut self) -> Result<(), CodexError> {
+        self.child.kill().await.map_err(CodexError::Io)
+    }
+}
+
 fn dynamic_tool_specs(tool_context: &DynamicToolContext) -> Vec<Value> {
     let mut specs = Vec::new();
     if tool_context.linear_graphql.is_some() {
         specs.push(LinearGraphqlTool::spec());
     }
     specs
+}
+
+fn shell_quote_single(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn maybe_tool_call_id(value: &Value) -> Option<Value> {
@@ -464,6 +661,50 @@ fn apply_server_message(value: &Value, outcome: &mut TurnOutcome) -> bool {
     }
 }
 
+fn apply_cursor_translated_message(value: &Value, outcome: &mut TurnOutcome) {
+    if let Some(params) = value.get("params") {
+        maybe_extract_ids(params, outcome);
+        maybe_extract_usage(params, outcome);
+    }
+    if let Some(result) = value.get("result") {
+        maybe_extract_ids(result, outcome);
+        maybe_extract_usage(result, outcome);
+    }
+    match value.get("type").and_then(Value::as_str) {
+        Some("error") => outcome.status = "failed".to_string(),
+        Some("result") => {
+            let is_error = value
+                .get("is_error")
+                .or_else(|| value.get("isError"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            outcome.status = if is_error {
+                "failed".to_string()
+            } else {
+                "completed".to_string()
+            };
+            maybe_extract_usage(value, outcome);
+        }
+        Some("assistant")
+        | Some("tool_call")
+        | Some("tool_result")
+        | Some("turn.started")
+        | Some("turn.delta")
+        | Some("turn.tool_call")
+        | Some("turn.tool_result") => {
+            if outcome.status == "unknown" {
+                outcome.status = "in_progress".to_string();
+            }
+        }
+        Some("turn.completed") => outcome.status = "completed".to_string(),
+        _ => {
+            if apply_server_message(value, outcome) {
+                return;
+            }
+        }
+    }
+}
+
 fn maybe_extract_ids(src: &Value, outcome: &mut TurnOutcome) {
     if let Some(thread_id) = src.get("threadId").and_then(|v| v.as_str()) {
         outcome.thread_id = Some(thread_id.to_string());
@@ -551,5 +792,36 @@ mod tests {
     fn rejects_multiple_graphql_operations() {
         let query = "query A { viewer { id } } query B { viewer { name } }";
         assert!(!contains_exactly_one_operation(query));
+    }
+
+    #[test]
+    fn cursor_message_marks_in_progress_for_assistant_events() {
+        let mut outcome = TurnOutcome {
+            status: "unknown".into(),
+            usage: None,
+            thread_id: None,
+            turn_id: None,
+        };
+        let msg = serde_json::json!({
+            "type": "assistant",
+            "message": { "content": [{ "type": "text", "text": "hello" }] }
+        });
+        apply_cursor_translated_message(&msg, &mut outcome);
+        assert_eq!(outcome.status, "in_progress");
+    }
+
+    #[test]
+    fn cursor_message_terminal_completed() {
+        let mut outcome = TurnOutcome {
+            status: "unknown".into(),
+            usage: None,
+            thread_id: None,
+            turn_id: None,
+        };
+        let msg = serde_json::json!({
+            "type": "turn.completed"
+        });
+        apply_cursor_translated_message(&msg, &mut outcome);
+        assert_eq!(outcome.status, "completed");
     }
 }

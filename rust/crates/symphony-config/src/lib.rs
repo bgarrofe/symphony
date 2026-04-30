@@ -30,6 +30,8 @@ pub struct Settings {
     pub codex: CodexConfig,
     #[serde(default)]
     pub tracker: TrackerConfig,
+    #[serde(default)]
+    pub runtime: RuntimeConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +74,8 @@ pub struct CodexConfig {
     pub turn_timeout_ms: u64,
     #[serde(default = "defaults::stall_timeout_ms")]
     pub stall_timeout_ms: u64,
+    #[serde(default = "defaults::detailed_app_server_logs")]
+    pub detailed_app_server_logs: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +94,12 @@ pub struct TrackerConfig {
     pub terminal_states: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeConfig {
+    #[serde(default = "defaults::runtime_interface")]
+    pub interface: String,
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -99,6 +109,7 @@ impl Default for Settings {
             agent: AgentConfig::default(),
             codex: CodexConfig::default(),
             tracker: TrackerConfig::default(),
+            runtime: RuntimeConfig::default(),
         }
     }
 }
@@ -145,6 +156,7 @@ impl Default for CodexConfig {
             command: defaults::codex_command(),
             turn_timeout_ms: defaults::turn_timeout_ms(),
             stall_timeout_ms: defaults::stall_timeout_ms(),
+            detailed_app_server_logs: defaults::detailed_app_server_logs(),
         }
     }
 }
@@ -158,6 +170,14 @@ impl Default for TrackerConfig {
             project: None,
             active_states: defaults::active_states(),
             terminal_states: defaults::terminal_states(),
+        }
+    }
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            interface: defaults::runtime_interface(),
         }
     }
 }
@@ -210,6 +230,12 @@ impl Settings {
         }
         if self.codex.stall_timeout_ms == 0 {
             return Err(ConfigError::Invalid("codex.stall_timeout_ms must be > 0".into()));
+        }
+        let iface = self.runtime.interface.trim().to_ascii_lowercase();
+        if iface != "codex" && iface != "cursor_cli" {
+            return Err(ConfigError::Invalid(
+                "runtime.interface must be either \"codex\" or \"cursor_cli\"".into(),
+            ));
         }
         Ok(())
     }
@@ -268,6 +294,12 @@ mod defaults {
     pub fn tracker_kind() -> String {
         "linear".to_string()
     }
+    pub fn detailed_app_server_logs() -> bool {
+        false
+    }
+    pub fn runtime_interface() -> String {
+        "codex".to_string()
+    }
     pub fn active_states() -> Vec<String> {
         vec![
             "todo".to_string(),
@@ -312,5 +344,24 @@ workspace:
         let explicit = PathBuf::from("/tmp/wf.md");
         assert_eq!(workflow_path(Some(explicit.clone())), explicit);
         assert_eq!(workflow_path(None), PathBuf::from("./WORKFLOW.md"));
+    }
+
+    #[test]
+    fn runtime_interface_defaults_to_codex() {
+        let cfg = Settings::default();
+        assert_eq!(cfg.runtime.interface, "codex");
+    }
+
+    #[test]
+    fn runtime_interface_validation_rejects_unknown_value() {
+        let mut cfg = Settings::default();
+        cfg.runtime.interface = "unknown_runtime".to_string();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn detailed_app_server_logs_defaults_to_disabled() {
+        let cfg = Settings::default();
+        assert!(!cfg.codex.detailed_app_server_logs);
     }
 }
