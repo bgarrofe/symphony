@@ -61,9 +61,9 @@ impl Workflow {
         let raw = raw.strip_prefix("---\n").ok_or_else(|| {
             WorkflowError::Parse("front matter must begin with a newline delimiter".into())
         })?;
-        let split_idx = raw
-            .find("\n---\n")
-            .ok_or_else(|| WorkflowError::Parse("front matter closing delimiter not found".into()))?;
+        let split_idx = raw.find("\n---\n").ok_or_else(|| {
+            WorkflowError::Parse("front matter closing delimiter not found".into())
+        })?;
         let fm_raw = &raw[..split_idx];
         let body = raw[split_idx + 5..].trim();
 
@@ -152,7 +152,8 @@ impl WorkflowStore {
 }
 
 fn default_prompt() -> String {
-    "Work issue {{ issue.identifier }} (attempt {{ attempt }}).\n{{ issue.description }}".to_string()
+    "Work issue {{ issue.identifier }} (attempt {{ attempt }}).\n{{ issue.description }}"
+        .to_string()
 }
 
 #[cfg(test)]
@@ -181,8 +182,11 @@ mod tests {
             .expect("clock")
             .as_nanos();
         let path = std::env::temp_dir().join(format!("wf-{ts}.md"));
-        fs::write(&path, "---\npolling:\n  interval_ms: 1\n---\nHello {{ issue.identifier }}")
-            .expect("write");
+        fs::write(
+            &path,
+            "---\npolling:\n  interval_ms: 1\n---\nHello {{ issue.identifier }}",
+        )
+        .expect("write");
         let mut store = WorkflowStore::load(&path).expect("load");
         assert_eq!(
             store
@@ -195,7 +199,9 @@ mod tests {
             "Hello A-1"
         );
         fs::write(&path, "---\nnot: [valid\n---\nOops").expect("write invalid");
-        let changed = store.reload_if_changed().expect("reload does not fail hard");
+        let changed = store
+            .reload_if_changed()
+            .expect("reload does not fail hard");
         assert!(!changed);
         assert!(store.current().prompt_template.contains("Hello"));
         let _ = fs::remove_file(path);

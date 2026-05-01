@@ -42,7 +42,10 @@ pub fn sanitize_issue_identifier(identifier: &str) -> String {
     re.replace_all(identifier, "_").to_string()
 }
 
-pub fn issue_workspace_path(root: &Path, issue_identifier: &str) -> Result<PathBuf, WorkspaceError> {
+pub fn issue_workspace_path(
+    root: &Path,
+    issue_identifier: &str,
+) -> Result<PathBuf, WorkspaceError> {
     let safe = sanitize_issue_identifier(issue_identifier);
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let child = root.join(safe);
@@ -52,7 +55,10 @@ pub fn issue_workspace_path(root: &Path, issue_identifier: &str) -> Result<PathB
     Ok(child)
 }
 
-pub async fn create_workspace(root: &Path, issue_identifier: &str) -> Result<PathBuf, WorkspaceError> {
+pub async fn create_workspace(
+    root: &Path,
+    issue_identifier: &str,
+) -> Result<PathBuf, WorkspaceError> {
     let path = issue_workspace_path(root, issue_identifier)?;
     tokio::fs::create_dir_all(&path).await?;
     Ok(path)

@@ -3,8 +3,8 @@ use graphql_parser::query::Document;
 use reqwest::Client;
 use reqwest::header::AUTHORIZATION;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
@@ -31,6 +31,8 @@ pub enum CodexError {
     ResponseError(String),
     #[error("turn requires user input")]
     TurnInputRequired,
+    #[error("codex approval required (non-interactive session)")]
+    ApprovalRequired,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +56,13 @@ pub struct DynamicToolContext {
 }
 
 #[derive(Debug, Clone)]
+pub struct CodexSessionPolicies {
+    pub approval_policy: Value,
+    pub thread_sandbox: String,
+    pub turn_sandbox_policy: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
 pub struct LinearGraphqlTool {
     endpoint: String,
     token: String,
@@ -61,11 +70,16 @@ pub struct LinearGraphqlTool {
 }
 
 impl LinearGraphqlTool {
-    pub fn new(endpoint: String, token: String) -> Self {
+    pub fn new(endpoint: String, token: String, http_timeout_ms: u64) -> Self {
+        let ms = http_timeout_ms.max(1);
+        let client = Client::builder()
+            .timeout(Duration::from_millis(ms))
+            .build()
+            .unwrap_or_else(|_| Client::new());
         Self {
             endpoint,
             token,
-            client: Client::new(),
+            client,
         }
     }
 
@@ -89,10 +103,14 @@ impl LinearGraphqlTool {
         match normalize_linear_graphql_arguments(arguments) {
             Ok((query, variables)) => {
                 if !contains_exactly_one_operation(&query) {
-                    return failure_payload("`linear_graphql.query` must contain exactly one GraphQL operation.");
+                    return failure_payload(
+                        "`linear_graphql.query` must contain exactly one GraphQL operation.",
+                    );
                 }
                 match self
-                    .send_graphql_with_auth_fallback(json!({"query": query, "variables": variables}))
+                    .send_graphql_with_auth_fallback(
+                        json!({"query": query, "variables": variables}),
+                    )
                     .await
                 {
                     Ok(resp) => match resp.json::<Value>().await {
@@ -104,11 +122,13 @@ impl LinearGraphqlTool {
                                 .unwrap_or(false);
                             dynamic_tool_response(!has_errors, body)
                         }
-                        Err(err) => failure_payload(&format!("failed to decode Linear GraphQL response: {err}")),
+                        Err(err) => failure_payload(&format!(
+                            "failed to decode Linear GraphQL response: {err}"
+                        )),
                     },
-                    Err(err) => failure_payload(&format!(
-                        "Linear GraphQL transport failure: {err}"
-                    )),
+                    Err(err) => {
+                        failure_payload(&format!("Linear GraphQL transport failure: {err}"))
+                    }
                 }
             }
             Err(msg) => failure_payload(&msg),
@@ -163,12 +183,20 @@ impl CodexClient {
 
     pub async fn initialize(
         &mut self,
+        workspace_cwd: &str,
         input_prompt: &str,
+        turn_title: Option<&str>,
         turn_timeout_ms: u64,
+        read_timeout_ms: u64,
         stall_timeout_ms: u64,
         tool_context: DynamicToolContext,
+        policies: CodexSessionPolicies,
         detailed_app_server_logs: bool,
     ) -> Result<TurnOutcome, CodexError> {
+        let auto_approve_incoming_requests = matches!(
+            &policies.approval_policy,
+            Value::String(s) if s.eq_ignore_ascii_case("never")
+        );
         let mut stdin = self.child.stdin.take().ok_or(CodexError::MissingIo)?;
         info!("codex initialize: sending initialize request");
         let init = serde_json::json!({
@@ -184,10 +212,15 @@ impl CodexClient {
           }
         });
         let initialized = serde_json::json!({"jsonrpc":"2.0","method":"initialized","params":{}});
-        let thread_start = serde_json::json!({
-          "jsonrpc":"2.0","id":2,"method":"thread/start","params":{
-            "cwd":".",
-            "dynamicTools": dynamic_tool_specs(&tool_context)
+        let thread_start = json!({
+          "jsonrpc": "2.0",
+          "id": 2,
+          "method": "thread/start",
+          "params": {
+            "cwd": workspace_cwd,
+            "approvalPolicy": policies.approval_policy.clone(),
+            "sandbox": policies.thread_sandbox.clone(),
+            "dynamicTools": dynamic_tool_specs(&tool_context),
           }
         });
         for payload in [init, initialized, thread_start] {
@@ -209,10 +242,12 @@ impl CodexClient {
         };
         timeout(Duration::from_millis(turn_timeout_ms), async {
             let stall = Duration::from_millis(stall_timeout_ms);
+            let read_idle = Duration::from_millis(read_timeout_ms.max(1));
             let started = Instant::now();
             let mut saw_turn_start = false;
             loop {
-                let next = timeout(stall, reader.next_line())
+                let idle = if saw_turn_start { stall } else { read_idle };
+                let next = timeout(idle, reader.next_line())
                     .await
                     .map_err(|_| CodexError::StallTimeout)?
                     .map_err(CodexError::Io)?;
@@ -246,12 +281,26 @@ impl CodexClient {
                 if let Some(thread_id) = extract_thread_start_thread_id(&value) {
                     info!(thread_id=%thread_id, "codex initialize: thread started");
                     outcome.thread_id = Some(thread_id.clone());
-                    let turn_start = serde_json::json!({
-                      "jsonrpc":"2.0","id":3,"method":"turn/start","params":{
-                        "threadId": thread_id,
-                        "input":[{"type":"text","text":input_prompt}],
-                        "cwd": "."
-                      }
+                    let mut turn_params_map = serde_json::Map::from_iter([
+                        ("threadId".into(), json!(thread_id)),
+                        (
+                            "input".into(),
+                            json!([{"type":"text","text":input_prompt}]),
+                        ),
+                        ("cwd".into(), json!(workspace_cwd)),
+                        (
+                            "approvalPolicy".into(),
+                            policies.approval_policy.clone(),
+                        ),
+                    ]);
+                    if let Some(t) = turn_title {
+                        turn_params_map.insert("title".into(), json!(t));
+                    }
+                    if let Some(p) = &policies.turn_sandbox_policy {
+                        turn_params_map.insert("sandboxPolicy".into(), p.clone());
+                    }
+                    let turn_start = json!({
+                      "jsonrpc":"2.0","id":3,"method":"turn/start","params": turn_params_map
                     });
                     let serialized =
                         serde_json::to_string(&turn_start).map_err(CodexError::Serialize)?;
@@ -263,8 +312,11 @@ impl CodexClient {
                     saw_turn_start = true;
                     continue;
                 }
-                if let Some((approval_id, decision)) = maybe_auto_approval_request(&value) {
-                    let response = json!({"id": approval_id.clone(), "result": {"decision": decision}});
+                if let Some((approval_id, decision)) =
+                    classify_approval_prompt(auto_approve_incoming_requests, &value)?
+                {
+                    let response =
+                        json!({"id": approval_id.clone(), "result": {"decision": decision}});
                     let serialized =
                         serde_json::to_string(&response).map_err(CodexError::Serialize)?;
                     stdin
@@ -345,12 +397,19 @@ impl CursorCliClient {
 
     pub async fn initialize(
         &mut self,
-        _input_prompt: &str,
+        _workspace_cwd: &str,
+        _turn_title: Option<&str>,
         turn_timeout_ms: u64,
+        read_timeout_ms: u64,
         stall_timeout_ms: u64,
         tool_context: DynamicToolContext,
+        policies: CodexSessionPolicies,
         detailed_app_server_logs: bool,
     ) -> Result<TurnOutcome, CodexError> {
+        let auto_approve_incoming_requests = matches!(
+            &policies.approval_policy,
+            Value::String(s) if s.eq_ignore_ascii_case("never")
+        );
         let mut stdin = self.child.stdin.take().ok_or(CodexError::MissingIo)?;
         if let Some(stderr) = self.child.stderr.take() {
             tokio::spawn(async move {
@@ -386,10 +445,13 @@ impl CursorCliClient {
 
         timeout(Duration::from_millis(turn_timeout_ms), async {
             let stall = Duration::from_millis(stall_timeout_ms);
+            let read_idle = Duration::from_millis(read_timeout_ms.max(1));
             let started = Instant::now();
             let mut saw_any_event = false;
+            let mut after_first_json = false;
             loop {
-                let next = match timeout(stall, reader.next_line()).await {
+                let idle = if after_first_json { stall } else { read_idle };
+                let next = match timeout(idle, reader.next_line()).await {
                     Ok(result) => result.map_err(CodexError::Io)?,
                     Err(_) => {
                         info!(
@@ -417,6 +479,7 @@ impl CursorCliClient {
                     }
                     continue;
                 };
+                after_first_json = true;
                 if detailed_app_server_logs {
                     let raw_message = serde_json::to_string(&value).unwrap_or_else(|_| line.clone());
                     let raw_preview: String = raw_message.chars().take(2000).collect();
@@ -451,7 +514,9 @@ impl CursorCliClient {
                     info!(id=%tool_call_id, "cursor translation: outbound tool call result");
                     continue;
                 }
-                if let Some((approval_id, decision)) = maybe_auto_approval_request(&value) {
+                if let Some((approval_id, decision)) =
+                    classify_approval_prompt(auto_approve_incoming_requests, &value)?
+                {
                     let response = json!({"id": approval_id.clone(), "result": {"decision": decision}});
                     let serialized =
                         serde_json::to_string(&response).map_err(CodexError::Serialize)?;
@@ -533,17 +598,31 @@ fn maybe_protocol_error(value: &Value) -> Option<String> {
     ))
 }
 
-fn maybe_auto_approval_request(value: &Value) -> Option<(Value, &'static str)> {
-    let method = value.get("method").and_then(Value::as_str)?;
-    let id = value.get("id")?.clone();
+/// Classifies Codex inbound approval prompts. Auto-responds only when configured (Elixir parity:
+/// `"never"` ⇒ auto approve). Otherwise yields [`CodexError::ApprovalRequired`].
+fn classify_approval_prompt(
+    auto_approve_requests: bool,
+    value: &Value,
+) -> Result<Option<(Value, &'static str)>, CodexError> {
+    let method = match value.get("method").and_then(Value::as_str) {
+        Some(m) => m,
+        None => return Ok(None),
+    };
+    let id = match value.get("id").cloned() {
+        Some(id) => id,
+        None => return Ok(None),
+    };
     let decision = match method {
         "item/commandExecution/requestApproval" => "acceptForSession",
         "item/fileChange/requestApproval" => "acceptForSession",
         "execCommandApproval" => "approved_for_session",
         "applyPatchApproval" => "approved_for_session",
-        _ => return None,
+        _ => return Ok(None),
     };
-    Some((id, decision))
+    if !auto_approve_requests {
+        return Err(CodexError::ApprovalRequired);
+    }
+    Ok(Some((id, decision)))
 }
 
 fn extract_thread_start_thread_id(value: &Value) -> Option<String> {
@@ -560,8 +639,7 @@ fn extract_thread_start_thread_id(value: &Value) -> Option<String> {
 
 fn indicates_input_required(value: &Value) -> bool {
     if let Some(method) = value.get("method").and_then(Value::as_str) {
-        return method.contains("input")
-            || method.eq_ignore_ascii_case("approval_required");
+        return method.contains("input") || method.eq_ignore_ascii_case("approval_required");
     }
     false
 }
@@ -581,11 +659,17 @@ fn extract_tool_call(value: &Value) -> Option<(String, Value)> {
     Some((tool_name, arguments))
 }
 
-async fn execute_tool_call(tool_context: &DynamicToolContext, tool_name: &str, arguments: Value) -> Value {
+async fn execute_tool_call(
+    tool_context: &DynamicToolContext,
+    tool_name: &str,
+    arguments: Value,
+) -> Value {
     match tool_name {
         "linear_graphql" => match &tool_context.linear_graphql {
             Some(tool) => tool.execute(arguments).await,
-            None => failure_payload("`linear_graphql` requires tracker.kind=linear with valid auth."),
+            None => {
+                failure_payload("`linear_graphql` requires tracker.kind=linear with valid auth.")
+            }
         },
         _ => failure_payload(&format!("Unsupported dynamic tool: {tool_name}")),
     }
@@ -623,7 +707,9 @@ fn normalize_linear_graphql_arguments(arguments: Value) -> Result<(String, Value
 
 fn contains_exactly_one_operation(query: &str) -> bool {
     let parsed: Result<Document<'_, String>, _> = parse_query(query);
-    parsed.map(|doc| doc.definitions.len() == 1).unwrap_or(false)
+    parsed
+        .map(|doc| doc.definitions.len() == 1)
+        .unwrap_or(false)
 }
 
 fn dynamic_tool_response(success: bool, payload: Value) -> Value {
@@ -759,6 +845,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn approval_prompt_auto_responds_when_policy_never_equivalent() {
+        let msg = json!({
+            "method": "item/commandExecution/requestApproval",
+            "id": 42,
+            "params": {}
+        });
+        let out = classify_approval_prompt(true, &msg).expect("ok");
+        assert!(out.is_some());
+        let (id, _) = out.unwrap();
+        assert_eq!(id, json!(42));
+    }
+
+    #[test]
+    fn approval_prompt_errors_when_not_auto_approved() {
+        let msg = json!({
+            "method": "execCommandApproval",
+            "id": 7,
+            "params": {}
+        });
+        assert!(matches!(
+            classify_approval_prompt(false, &msg),
+            Err(CodexError::ApprovalRequired)
+        ));
+    }
+
+    #[test]
     fn apply_message_extracts_ids_usage_and_completion() {
         let mut outcome = TurnOutcome {
             status: "unknown".into(),
@@ -783,9 +895,14 @@ mod tests {
 
     #[test]
     fn linear_graphql_argument_validation() {
-        assert!(normalize_linear_graphql_arguments(json!({"query":"query { viewer { id } }"})).is_ok());
+        assert!(
+            normalize_linear_graphql_arguments(json!({"query":"query { viewer { id } }"})).is_ok()
+        );
         assert!(normalize_linear_graphql_arguments(json!({"query":"","variables":{}})).is_err());
-        assert!(normalize_linear_graphql_arguments(json!({"query":"query { x }","variables":"bad"})).is_err());
+        assert!(
+            normalize_linear_graphql_arguments(json!({"query":"query { x }","variables":"bad"}))
+                .is_err()
+        );
     }
 
     #[test]

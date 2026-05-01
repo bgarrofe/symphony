@@ -1,9 +1,9 @@
 use async_trait::async_trait;
-use reqwest::header::AUTHORIZATION;
 use reqwest::Client;
+use reqwest::header::AUTHORIZATION;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 use symphony_tracker::{Issue, IssueState, Tracker, TrackerError};
 
 #[derive(Debug, Clone)]
@@ -78,7 +78,11 @@ impl LinearTracker {
 #[async_trait]
 impl Tracker for LinearTracker {
     async fn fetch_candidate_issues(&self) -> Result<Vec<Issue>, TrackerError> {
-        let (query, variables) = if self.project.as_deref().is_some_and(|v| !v.trim().is_empty()) {
+        let (query, variables) = if self
+            .project
+            .as_deref()
+            .is_some_and(|v| !v.trim().is_empty())
+        {
             (
                 r#"
 query CandidateIssues($projectSlug: String!) {
@@ -97,7 +101,7 @@ query CandidateIssues($projectSlug: String!) {
   }
 }
 "#,
-                json!({ "projectSlug": self.project })
+                json!({ "projectSlug": self.project }),
             )
         } else {
             (
@@ -118,7 +122,7 @@ query CandidateIssues {
   }
 }
 "#,
-                json!({})
+                json!({}),
             )
         };
         #[derive(Deserialize)]
@@ -219,7 +223,7 @@ query CandidateIssues {
                 priority: i.priority,
                 state: i.state.name.to_ascii_lowercase(),
                 blocked_by: vec![],
-                assigned_to_worker: None,
+                assigned_to_worker: true,
                 created_at: i.created_at,
             })
             .collect();

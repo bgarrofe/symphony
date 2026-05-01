@@ -14,8 +14,14 @@ pub struct Issue {
     pub priority: i32,
     pub state: String,
     pub blocked_by: Vec<String>,
-    pub assigned_to_worker: Option<String>,
+    /// When false, Elixir skips dispatch (`issue_routable_to_worker?/1`). Defaults to true when unknown.
+    #[serde(default = "default_assigned_to_worker")]
+    pub assigned_to_worker: bool,
     pub created_at: DateTime<Utc>,
+}
+
+fn default_assigned_to_worker() -> bool {
+    true
 }
 
 impl Issue {

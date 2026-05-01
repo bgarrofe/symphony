@@ -1,0 +1,15 @@
+[package]
+name = "symphony-observability"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+symphony-core = { path = "../symphony-core" }
+tokio.workspace = true
+
+[dev-dependencies]
+tower.workspace = true

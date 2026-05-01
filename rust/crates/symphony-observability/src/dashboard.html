@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Symphony observability</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 1.5rem; background: #0f1419; color: #e6edf3; }
+    h1 { font-size: 1.25rem; }
+    table { border-collapse: collapse; width: 100%; max-width: 960px; margin-top: 1rem; }
+    th, td { border: 1px solid #30363d; padding: 0.5rem 0.65rem; text-align: left; font-size: 0.875rem; }
+    th { background: #161b22; }
+    .muted { color: #8b949e; font-size: 0.8rem; margin-top: 0.5rem; }
+    a { color: #58a6ff; }
+  </style>
+</head>
+<body>
+  <h1>Symphony</h1>
+  <p class="muted">Auto-refresh every <span id="interval"></span> ms · <a href="/api/v1/state">Raw JSON</a></p>
+  <h2>Running</h2>
+  <div id="running"></div>
+  <h2>Retry queue</h2>
+  <div id="retrying"></div>
+  <script>
+    const REFRESH_MS = __REFRESH_MS__;
+    document.getElementById('interval').textContent = String(REFRESH_MS);
+    async function load() {
+      const r = await fetch('/api/v1/state');
+      const j = await r.json();
+      if (j.error) {
+        document.getElementById('running').textContent = j.error.message || JSON.stringify(j.error);
+        return;
+      }
+      function table(rows, cols) {
+        if (!rows.length) return '<p class="muted">None</p>';
+        let h = '<table><thead><tr>' + cols.map(c => '<th>' + c + '</th>').join('') + '</tr></thead><tbody>';
+        for (const row of rows) {
+          h += '<tr>' + cols.map(c => '<td>' + (row[c] ?? '') + '</td>').join('') + '</tr>';
+        }
+        return h + '</tbody></table>';
+      }
+      const runCols = ['issue_identifier', 'issue_state', 'attempt', 'turns_completed', 'workspace_path'];
+      const runRows = (j.running || []).map(w => ({
+        issue_identifier: w.issue_identifier,
+        issue_state: w.issue_state,
+        attempt: w.attempt,
+        turns_completed: w.turns_completed,
+        workspace_path: w.workspace_path,
+      }));
+      document.getElementById('running').innerHTML = table(runRows, runCols);
+      const retCols = ['issue_identifier', 'attempt', 'due_at', 'error'];
+      const retRows = (j.retrying || []).map(x => ({
+        issue_identifier: x.issue_identifier,
+        attempt: x.attempt,
+        due_at: x.due_at,
+        error: x.error || '',
+      }));
+      document.getElementById('retrying').innerHTML = table(retRows, retCols);
+    }
+    load();
+    setInterval(load, REFRESH_MS);
+  </script>
+</body>
+</html>

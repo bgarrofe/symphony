@@ -6,9 +6,11 @@ edition = "2024"
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
+futures.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 symphony-config = { path = "../symphony-config" }
 symphony-codex = { path = "../symphony-codex" }

@@ -28,12 +28,15 @@ Implemented:
 - Dual runtime interface selection (`codex` default, optional `cursor_cli` translation path)
 - Core orchestrator dispatch/retry/token bookkeeping baseline
 - Unit tests covering major primitives
+- Optional **HTTP observability API** and minimal web dashboard (`symphony-observability`, Elixir-aligned routes) when `server.port > 0` or via CLI `--port`
+- CLI flags: `--port`, `--host`, `--logs-root`, optional guardrails acknowledgment (see below)
 
 Not yet complete:
 
 - Full one-to-one parity with all Elixir runtime semantics
 - Full acceptance test matrix from `SPEC.md`
-- Optional extensions (HTTP observability API, dynamic tools, SSH worker mode)
+- Parity gaps for observability JSON (per-issue Codex session fields, live rate limits) — see Observability section
+- **SSH remote execution**: `worker.ssh_hosts` and per-host limits are enforced for **scheduling/capacity**; the Rust runtime still launches Codex/Cursor **locally** in the workspace (remote process launch is not wired yet).
 
 ---
 
@@ -53,6 +56,7 @@ Crates:
 - `crates/symphony-tracker-linear` - Linear GraphQL tracker adapter.
 - `crates/symphony-workspace` - Workspace naming/path safety, hooks, create/remove helpers.
 - `crates/symphony-codex` - Codex app-server process integration and protocol loop.
+- `crates/symphony-observability` - Axum HTTP server: `/api/v1/state`, `/api/v1/refresh`, `/api/v1/{issue_identifier}`, optional `/` dashboard.
 
 ---
 
@@ -84,11 +88,18 @@ Run the CLI:
 ```bash
 cd symphony/rust
 cargo run -p symphony-cli -- ../WORKFLOW.md
+# or (same default path)
+cargo run -p symphony-cli
 ```
 
-If no argument is provided, workflow path resolution defaults to:
+Use `cargo run -p symphony-cli -- --help` for flags. Common options:
 
-- `./WORKFLOW.md` (relative to process working directory)
+- `--port <u16>` — overrides `server.port` (non-zero starts the observability listener).
+- `--host <str>` — overrides `server.host` (bind address).
+- `--logs-root <dir>` — writes tracing output to `<dir>/symphony.log` (non-blocking) in addition to stderr.
+- `--i-understand-that-this-will-be-running-without-the-usual-guardrails` — required when `runtime.require_guardrails_ack: true` in workflow front matter (default is `false`).
+
+If no positional workflow argument is given, the default is `./WORKFLOW.md` (relative to the process working directory).
 
 ---
 
@@ -141,15 +152,63 @@ Current typed settings tree (from `symphony-config`):
 - `hooks.after_create` / `hooks.before_run` / `hooks.after_run` / `hooks.before_remove`
 - `hooks.timeout_ms`
 - `agent.max_turns` (must be `> 0`)
+- `agent.max_concurrent_agents` (must be `> 0`, default `1`)
+- `agent.max_retry_backoff_ms` (must be `> 0`, default `300000`; caps exponential failure/stall retry delays, Elixir-aligned base `10s * 2^n`)
+- `agent.max_concurrent_agents_by_state` (optional map `state_name -> limit`; compares case-insensitively to tracker state)
+- `worker.ssh_hosts` (optional list of SSH destinations, e.g. `host` or `host:port`)
+- `worker.max_concurrent_agents_per_host` (optional; must be `> 0` and requires non-empty `ssh_hosts`)
 - `codex.command` (non-empty)
+- `codex.approval_policy` (JSON string or map; default is Elixir-style `reject:{sandbox_approval,rules,mcp_elicitations}` map; string `"never"` enables auto-approval of session prompts — matches Elixir)
+- `codex.thread_sandbox` (required when set; default `workspace-write`; sent as `sandbox` on `thread/start`)
+- `codex.turn_sandbox_policy` (optional map; sent as `sandboxPolicy` on `turn/start` when present)
 - `codex.turn_timeout_ms` (total turn stream timeout, default `900000`)
+- `codex.read_timeout_ms` (must be `> 0`, default `5000`; shorter idle deadline **before** the first Codex protocol event in a turn, analogous to Elixir handshake read timeout)
 - `codex.stall_timeout_ms`
 - `codex.detailed_app_server_logs` (default `false`; when true, logs full app-server message payloads)
 - `runtime.interface` (`codex` default, or `cursor_cli`)
+- `runtime.require_guardrails_ack` (default `false`; when `true`, CLI must pass the long acknowledgment flag above)
+- `server.host` (default `127.0.0.1`)
+- `server.port` (default `0` = no HTTP server; set `> 0` to enable observability API on that port)
+- `observability.api_enabled` (default `false`; if `true`, `server.port` must be `> 0` — you can also enable HTTP by setting `server.port` alone)
+- `observability.web_dashboard_enabled` (default `true`; serves a minimal HTML page at `/` that polls `/api/v1/state`)
+- `observability.refresh_ms` (default `3000`; interval hint for the dashboard auto-refresh)
 - `tracker.kind`
 - `tracker.endpoint` / `tracker.token` / `tracker.project`
 
 Environment indirection is supported for selected string fields via `$VAR_NAME`.
+
+### Example: observability server
+
+```yaml
+server:
+  host: 127.0.0.1
+  port: 8787
+observability:
+  api_enabled: true
+  web_dashboard_enabled: true
+  refresh_ms: 3000
+```
+
+Equivalent: `cargo run -p symphony-cli -- --port 8787 ./WORKFLOW.md` (CLI overrides `server.port` after loading the file).
+
+---
+
+## Observability (HTTP)
+
+When `server.port > 0` (after config + CLI merge), the CLI spawns **`symphony-observability`** on `server.host:server.port`.
+
+**Routes** (aligned with the Elixir Phoenix router where practical):
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/v1/state` | JSON snapshot: `generated_at`, `counts`, `running`, `retrying`, `codex_totals` (subset), `rate_limits` (empty object). |
+| `POST` | `/api/v1/refresh` | `202` — wakes the poll loop so the next orchestrator tick runs without waiting the full `polling.interval_ms`. |
+| `GET` | `/api/v1/{issue_identifier}` | Single-issue aggregate; `404` with `{ "error": { "code", "message" } }` if not running or retrying. |
+| `GET` | `/` | Minimal HTML dashboard (only if `observability.web_dashboard_enabled` is true). |
+
+**Stale snapshots:** the orchestrator publishes into a shared `RwLock<OrchestratorSnapshot>` after dispatch is scheduled (issues appear in `running`) and again after the tick finishes. While Codex work is in flight inside a tick, HTTP readers see the last published copy; `turns_completed` and similar fields may lag until the tick completes. This avoids holding a lock across long-running agent I/O.
+
+**JSON parity vs Elixir:** running rows use Rust field names (e.g. `issue_state` instead of Elixir’s `state`); per-issue Codex session telemetry (`session_id`, token breakdown per turn, `last_event`) is not wired in this baseline. `codex_totals` exposes aggregate `total_tokens` with other counters zero-filled until deeper instrumentation exists.
 
 ---
 
@@ -160,10 +219,10 @@ High-level flow:
 1. CLI loads workflow and settings.
 2. Orchestrator runs a tick:
    - reload workflow if changed
-   - reconcile due retries
+   - reconcile due retries (persists preferred `worker_host` metadata for the next dispatch when a timer fires)
    - fetch candidate issues from tracker
    - sort candidates by priority/creation/identifier
-   - dispatch eligible issues
+   - dispatch eligible issues subject to **global** `agent.max_concurrent_agents`, **per-state** `agent.max_concurrent_agents_by_state`, and **per-SSH-host** `worker.max_concurrent_agents_per_host` (when `worker.ssh_hosts` is configured)
 3. Issue run:
    - create issue workspace
    - run lifecycle hooks
@@ -216,7 +275,7 @@ Current recommended environment variables for workflow front matter:
 `symphony-codex` currently provides:
 
 - Child process management using `tokio::process`
-- Initialization + thread/turn start message dispatch
+- Initialization + thread/turn start message dispatch including `approvalPolicy`, `sandbox` / `sandboxPolicy`, and absolute workspace `cwd` (Codex path)
 - Newline-oriented JSON message stream handling
 - Graceful tolerance for malformed/non-JSON output lines
 - Extraction of:
