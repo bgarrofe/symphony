@@ -38,3 +38,5 @@ tower = { version = "0.5", features = ["util"] }
 tracing-appender = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+ratatui = "0.28"
+crossterm = "0.28"

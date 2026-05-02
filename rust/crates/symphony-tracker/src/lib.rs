@@ -24,15 +24,6 @@ fn default_assigned_to_worker() -> bool {
     true
 }
 
-impl Issue {
-    pub fn is_terminal(&self) -> bool {
-        matches!(
-            self.state.to_ascii_lowercase().as_str(),
-            "done" | "canceled" | "cancelled"
-        )
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IssueState {
     pub id: String,

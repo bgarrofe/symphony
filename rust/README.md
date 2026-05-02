@@ -29,6 +29,7 @@ Implemented:
 - Core orchestrator dispatch/retry/token bookkeeping baseline
 - Unit tests covering major primitives
 - Optional **HTTP observability API** and minimal web dashboard (`symphony-observability`, Elixir-aligned routes) when `server.port > 0` or via CLI `--port`
+- Optional **terminal dashboard (TUI)** with live running/retry status (`--tui` or `observability.tui_enabled: true`)
 - CLI flags: `--port`, `--host`, `--logs-root`, optional guardrails acknowledgment (see below)
 
 Not yet complete:
@@ -97,6 +98,7 @@ Use `cargo run -p symphony-cli -- --help` for flags. Common options:
 - `--port <u16>` — overrides `server.port` (non-zero starts the observability listener).
 - `--host <str>` — overrides `server.host` (bind address).
 - `--logs-root <dir>` — writes tracing output to `<dir>/symphony.log` (non-blocking) in addition to stderr.
+- `--tui` — enables the terminal dashboard UI.
 - `--i-understand-that-this-will-be-running-without-the-usual-guardrails` — required when `runtime.require_guardrails_ack: true` in workflow front matter (default is `false`).
 
 If no positional workflow argument is given, the default is `./WORKFLOW.md` (relative to the process working directory).
@@ -172,10 +174,14 @@ Current typed settings tree (from `symphony-config`):
 - `observability.api_enabled` (default `false`; if `true`, `server.port` must be `> 0` — you can also enable HTTP by setting `server.port` alone)
 - `observability.web_dashboard_enabled` (default `true`; serves a minimal HTML page at `/` that polls `/api/v1/state`)
 - `observability.refresh_ms` (default `3000`; interval hint for the dashboard auto-refresh)
+- `observability.tui_enabled` (default `false`; renders a local terminal dashboard; CLI `--tui` also enables it)
 - `tracker.kind`
 - `tracker.endpoint` / `tracker.token` / `tracker.project`
+- `tracker.active_states` (workflow states for candidate polling; filtered server-side when non-empty; when empty, the Linear adapter pages issues without a state filter—optional project filter only)
+- `tracker.terminal_states` (case-insensitive workflow state names; used for running reconciliation / terminal workspace cleanup **and** for dispatch suppression—custom terminal labels must appear here to avoid routing terminal issues)
+- `tracker.assignee` (optional Linear user id filter for dispatch routing; maps Elixir’s assignee semantics onto `assigned_to_worker`. Use string `me` to resolve the authenticated viewer via Linear `viewer { id }`; whitespace-only values are treated as unset)
 
-Environment indirection is supported for selected string fields via `$VAR_NAME`.
+Environment indirection is supported for selected string fields via `$VAR_NAME` (including `tracker.endpoint`, `tracker.token`, `tracker.project`, and `tracker.assignee`, e.g. `$LINEAR_ASSIGNEE`).
 
 ### Example: observability server
 
@@ -190,6 +196,20 @@ observability:
 ```
 
 Equivalent: `cargo run -p symphony-cli -- --port 8787 ./WORKFLOW.md` (CLI overrides `server.port` after loading the file).
+
+### Example: terminal dashboard (TUI)
+
+```yaml
+observability:
+  tui_enabled: true
+  refresh_ms: 500
+```
+
+Or enable ad-hoc from CLI:
+
+```bash
+cargo run -p symphony-cli -- --tui ./WORKFLOW.md
+```
 
 ---
 
@@ -209,6 +229,19 @@ When `server.port > 0` (after config + CLI merge), the CLI spawns **`symphony-ob
 **Stale snapshots:** the orchestrator publishes into a shared `RwLock<OrchestratorSnapshot>` after dispatch is scheduled (issues appear in `running`) and again after the tick finishes. While Codex work is in flight inside a tick, HTTP readers see the last published copy; `turns_completed` and similar fields may lag until the tick completes. This avoids holding a lock across long-running agent I/O.
 
 **JSON parity vs Elixir:** running rows use Rust field names (e.g. `issue_state` instead of Elixir’s `state`); per-issue Codex session telemetry (`session_id`, token breakdown per turn, `last_event`) is not wired in this baseline. `codex_totals` exposes aggregate `total_tokens` with other counters zero-filled until deeper instrumentation exists.
+
+## Observability (TUI)
+
+When enabled, the terminal dashboard renders a compact status view inspired by the Elixir dashboard:
+
+- Header metrics (`SYMPHONY STATUS`, agents, runtime, token totals, project URL, next refresh)
+- Running workers table (`ID`, `STAGE`, `PID`, `AGE / TURN`, `TOKENS`, `SESSION`, `EVENT`)
+- Backoff queue section
+
+Controls:
+
+- `q` — quit
+- `Ctrl+C` — quit
 
 ---
 
@@ -260,13 +293,21 @@ Defines required tracker operations:
 
 ### Linear Adapter (`symphony-tracker-linear`)
 
-Current adapter uses GraphQL over HTTP and normalizes fields into `Issue` / `IssueState`.
+The adapter uses GraphQL over HTTP and normalizes fields into `Issue` / `IssueState`.
 
-Current recommended environment variables for workflow front matter:
+Behavior aligned with the Elixir reference:
+
+- **Paged polling:** candidate issues are fetched with a workflow-state filter (`tracker.active_states`) and cursor pagination; terminal cleanup uses `fetch_issues_by_states` with the same paged query shape **without** assignee filtering.
+- **Batched id lookups:** `fetch_issue_states_by_ids` uses targeted `issues(filter: { id: { in: $ids } })` queries in batches of 50, preserving the caller’s id order in the result (matching Elixir batching).
+- **Assignee routing:** when `tracker.assignee` is set, issues include Linear `assignee { id }`; `assigned_to_worker` is true only when that id matches the configured filter (or the resolved viewer id for `me`).
+- **Auth fallback:** requests send `Authorization: <token>` first and retry with `Bearer <token>` on `401`, consistent with previous Rust behavior.
+
+Recommended environment variables for workflow front matter:
 
 - `LINEAR_ENDPOINT`
 - `LINEAR_TOKEN`
 - `LINEAR_PROJECT` (optional)
+- `LINEAR_ASSIGNEE` (optional; use via `tracker.assignee: $LINEAR_ASSIGNEE` in YAML front matter if desired)
 
 ---
 

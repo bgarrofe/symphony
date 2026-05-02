@@ -17,3 +17,6 @@ symphony-codex = { path = "../symphony-codex" }
 symphony-tracker = { path = "../symphony-tracker" }
 symphony-workflow = { path = "../symphony-workflow" }
 symphony-workspace = { path = "../symphony-workspace" }
+
+[dev-dependencies]
+async-trait.workspace = true

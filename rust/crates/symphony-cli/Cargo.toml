@@ -11,6 +11,9 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
+chrono.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
 symphony-core = { path = "../symphony-core" }
 symphony-observability = { path = "../symphony-observability" }
 symphony-config = { path = "../symphony-config" }

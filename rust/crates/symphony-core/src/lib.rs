@@ -1,5 +1,4 @@
 use chrono::{DateTime, Utc};
-use futures::stream::{FuturesUnordered, StreamExt};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::os::unix::fs::PermissionsExt;
@@ -7,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
 use tracing::{error, info};
 
@@ -73,6 +73,12 @@ struct IssueRunSummary {
     disposition: RunDisposition,
 }
 
+#[derive(Debug)]
+struct RunCompletion {
+    issue_id: String,
+    result: Result<IssueRunSummary, CoreError>,
+}
+
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct OrchestratorSnapshot {
     pub running: Vec<RunningWorker>,
@@ -101,6 +107,7 @@ pub struct Orchestrator<T: Tracker> {
     retries: BTreeMap<String, RetryEntry>,
     /// Preferences captured when retry timers fire; consumed on dispatch.
     retry_worker_pref: HashMap<String, Option<String>>,
+    run_tasks: HashMap<String, JoinHandle<Result<IssueRunSummary, CoreError>>>,
     total_tokens: u64,
     retry_token_seq: u64,
     snapshot_publisher: Option<Arc<RwLock<OrchestratorSnapshot>>>,
@@ -124,6 +131,7 @@ impl<T: Tracker> Orchestrator<T> {
             claimed: BTreeSet::new(),
             retries: BTreeMap::new(),
             retry_worker_pref: HashMap::new(),
+            run_tasks: HashMap::new(),
             total_tokens: 0,
             retry_token_seq: 0,
             snapshot_publisher,
@@ -151,7 +159,9 @@ impl<T: Tracker> Orchestrator<T> {
     pub async fn tick(&mut self) -> Result<(), CoreError> {
         info!("orchestrator tick started");
         let _ = self.workflow_store.reload_if_changed();
+        self.drain_completed_runs().await;
         self.reconcile_retries();
+        self.reconcile_stalled_running();
         self.reconcile_running_states().await?;
         self.cleanup_terminal_issue_workspaces().await?;
         let mut candidates = self.tracker.fetch_candidate_issues().await?;
@@ -172,7 +182,6 @@ impl<T: Tracker> Orchestrator<T> {
             return Ok(());
         }
 
-        let mut selected = Vec::new();
         for issue in candidates {
             if !self.is_dispatch_eligible(&issue) {
                 continue;
@@ -222,68 +231,88 @@ impl<T: Tracker> Orchestrator<T> {
                     stall_restarts: retry_attempt.saturating_sub(1),
                 },
             );
-            selected.push((issue, retry_attempt));
+            self.spawn_issue_run(issue, retry_attempt);
         }
 
         self.publish_snapshot().await;
-
-        let mut runs = FuturesUnordered::new();
-        for (issue, retry_attempt) in &selected {
-            runs.push(run_issue_once(
-                self.settings.clone(),
-                self.workflow_store.clone(),
-                issue.clone(),
-                *retry_attempt,
-            ));
-        }
-
-        while let Some(result) = runs.next().await {
-            match result {
-                Ok(summary) => {
-                    self.total_tokens = self.total_tokens.saturating_add(summary.usage_tokens);
-                    if let Some(worker) = self.running.get_mut(&summary.issue.id) {
-                        worker.turns_completed = summary.turns_completed;
-                        worker.last_activity_at = summary.last_activity_at;
-                    }
-                    match summary.disposition {
-                        RunDisposition::Completed => {
-                            let host_pref = self
-                                .running
-                                .get(&summary.issue.id)
-                                .and_then(|w| w.worker_host.clone());
-                            self.enqueue_continuation_retry(&summary.issue, host_pref);
-                        }
-                        RunDisposition::Failed(reason) => {
-                            error!(issue=%summary.issue.identifier, reason=%reason, "issue run failed");
-                            let host_pref = self
-                                .running
-                                .get(&summary.issue.id)
-                                .and_then(|w| w.worker_host.clone());
-                            self.enqueue_failure_retry(&summary.issue, host_pref, Some(reason));
-                        }
-                        RunDisposition::Stalled(reason) => {
-                            info!(issue=%summary.issue.identifier, reason=%reason, "run stalled, scheduling restart");
-                            let host_pref = self
-                                .running
-                                .get(&summary.issue.id)
-                                .and_then(|w| w.worker_host.clone());
-                            self.enqueue_stall_retry(&summary.issue, host_pref, Some(reason));
-                        }
-                    }
-                }
-                Err(err) => {
-                    error!(error=%err, "issue task failed unexpectedly");
-                }
-            }
-        }
-
-        for (issue, _) in selected {
-            self.claimed.remove(&issue.id);
-            self.running.remove(&issue.id);
-        }
         self.publish_snapshot().await;
         info!("orchestrator tick finished");
         Ok(())
+    }
+
+    fn spawn_issue_run(&mut self, issue: Issue, retry_attempt: u32) {
+        let settings = self.settings.clone();
+        let workflow_store = self.workflow_store.clone();
+        let issue_id = issue.id.clone();
+        let handle = tokio::spawn(async move {
+            run_issue_once(settings, workflow_store, issue, retry_attempt).await
+        });
+        self.run_tasks.insert(issue_id, handle);
+    }
+
+    async fn drain_completed_runs(&mut self) {
+        let completed_ids: Vec<String> = self
+            .run_tasks
+            .iter()
+            .filter_map(|(issue_id, handle)| handle.is_finished().then_some(issue_id.clone()))
+            .collect();
+        for issue_id in completed_ids {
+            let Some(handle) = self.run_tasks.remove(&issue_id) else {
+                continue;
+            };
+            let completion = match handle.await {
+                Ok(result) => RunCompletion { issue_id, result },
+                Err(err) => RunCompletion {
+                    issue_id,
+                    result: Err(CoreError::Runtime(format!(
+                        "issue task join failed: {err}"
+                    ))),
+                },
+            };
+            self.apply_run_completion(completion);
+        }
+    }
+
+    fn apply_run_completion(&mut self, completion: RunCompletion) {
+        let issue_id = completion.issue_id;
+        let Some(worker_snapshot) = self.running.get(&issue_id).cloned() else {
+            info!(issue_id=%issue_id, "ignoring completion for non-running issue");
+            self.claimed.remove(&issue_id);
+            return;
+        };
+        match completion.result {
+            Ok(summary) => {
+                self.total_tokens = self.total_tokens.saturating_add(summary.usage_tokens);
+                if let Some(worker) = self.running.get_mut(&summary.issue.id) {
+                    worker.turns_completed = summary.turns_completed;
+                    worker.last_activity_at = summary.last_activity_at;
+                }
+                let host_pref = self
+                    .running
+                    .get(&summary.issue.id)
+                    .and_then(|w| w.worker_host.clone());
+                match summary.disposition {
+                    RunDisposition::Completed => {
+                        self.enqueue_continuation_retry(&summary.issue, host_pref);
+                    }
+                    RunDisposition::Failed(reason) => {
+                        error!(issue=%summary.issue.identifier, reason=%reason, "issue run failed");
+                        self.enqueue_failure_retry(&summary.issue, host_pref, Some(reason));
+                    }
+                    RunDisposition::Stalled(reason) => {
+                        info!(issue=%summary.issue.identifier, reason=%reason, "run stalled, scheduling restart");
+                        self.enqueue_stall_retry(&summary.issue, host_pref, Some(reason));
+                    }
+                }
+            }
+            Err(err) => {
+                error!(issue=%worker_snapshot.issue_identifier, error=%err, "issue task failed unexpectedly");
+                let issue = issue_from_running_worker(&worker_snapshot);
+                self.enqueue_failure_retry(&issue, worker_snapshot.worker_host.clone(), Some(err.to_string()));
+            }
+        }
+        self.running.remove(&issue_id);
+        self.claimed.remove(&issue_id);
     }
 
     fn reconcile_retries(&mut self) {
@@ -299,7 +328,7 @@ impl<T: Tracker> Orchestrator<T> {
     }
 
     fn is_dispatch_eligible(&self, issue: &Issue) -> bool {
-        if issue.is_terminal() {
+        if self.is_terminal_state(&issue.state) {
             return false;
         }
         if !issue.assigned_to_worker {
@@ -403,6 +432,38 @@ impl<T: Tracker> Orchestrator<T> {
         }
     }
 
+    fn reconcile_stalled_running(&mut self) {
+        let timeout_ms = self.settings.codex.stall_timeout_ms;
+        if timeout_ms == 0 {
+            return;
+        }
+        let timeout_ms_i64 = i64::try_from(timeout_ms).unwrap_or(i64::MAX);
+        let now = Utc::now();
+        let stalled_ids: Vec<String> = self
+            .running
+            .values()
+            .filter(|worker| {
+                now.signed_duration_since(worker.last_activity_at).num_milliseconds()
+                    > timeout_ms_i64
+            })
+            .map(|worker| worker.issue_id.clone())
+            .collect();
+        for issue_id in stalled_ids {
+            if let Some(handle) = self.run_tasks.remove(&issue_id) {
+                handle.abort();
+            }
+            if let Some(worker) = self.running.remove(&issue_id) {
+                let issue = issue_from_running_worker(&worker);
+                let reason = format!(
+                    "cross-tick inactivity exceeded stall timeout ({}ms)",
+                    timeout_ms
+                );
+                self.enqueue_stall_retry(&issue, worker.worker_host.clone(), Some(reason));
+                self.claimed.remove(&issue_id);
+            }
+        }
+    }
+
     async fn reconcile_running_states(&mut self) -> Result<(), CoreError> {
         if self.running.is_empty() {
             return Ok(());
@@ -422,8 +483,12 @@ impl<T: Tracker> Orchestrator<T> {
             .cloned()
             .collect();
         for issue_id in stale_ids {
+            if let Some(handle) = self.run_tasks.remove(&issue_id) {
+                handle.abort();
+            }
             if let Some(worker) = self.running.remove(&issue_id) {
                 info!(issue=%worker.issue_identifier, "reconciled running issue no longer active");
+                self.claimed.remove(&issue_id);
                 self.cleanup_workspace_with_hooks(&worker.workspace_path)
                     .await?;
             }
@@ -569,6 +634,22 @@ fn retry_entry_to_snapshot(issue_id: &str, entry: &RetryEntry) -> RetrySnapshot 
         worker_host: entry.worker_host.clone(),
         workspace_path: entry.workspace_path.clone(),
         error: entry.last_error.clone(),
+    }
+}
+
+fn issue_from_running_worker(worker: &RunningWorker) -> Issue {
+    Issue {
+        id: worker.issue_id.clone(),
+        identifier: worker.issue_identifier.clone(),
+        title: String::new(),
+        description: String::new(),
+        labels: vec![],
+        url: String::new(),
+        priority: 0,
+        state: worker.issue_state.clone(),
+        blocked_by: vec![],
+        assigned_to_worker: true,
+        created_at: worker.started_at,
     }
 }
 
@@ -851,7 +932,81 @@ pub fn sort_candidates(candidates: &mut [Issue]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use symphony_config::Settings;
+    use symphony_tracker::{IssueState, Tracker, TrackerError};
+    use symphony_workflow::WorkflowStore;
+    use tokio::time::sleep;
+
+    struct StaticTracker {
+        candidates: Vec<Issue>,
+        state_overrides: HashMap<String, String>,
+    }
+
+    #[async_trait]
+    impl Tracker for StaticTracker {
+        async fn fetch_candidate_issues(&self) -> Result<Vec<Issue>, TrackerError> {
+            Ok(self.candidates.clone())
+        }
+
+        async fn fetch_issues_by_states(&self, states: &[String]) -> Result<Vec<Issue>, TrackerError> {
+            Ok(self
+                .candidates
+                .iter()
+                .filter(|i| states.iter().any(|s| i.state.eq_ignore_ascii_case(s)))
+                .cloned()
+                .collect())
+        }
+
+        async fn fetch_issue_states_by_ids(
+            &self,
+            ids: &[String],
+        ) -> Result<Vec<IssueState>, TrackerError> {
+            Ok(ids
+                .iter()
+                .map(|id| IssueState {
+                    id: id.clone(),
+                    state: self
+                        .state_overrides
+                        .get(id)
+                        .cloned()
+                        .or_else(|| {
+                            self.candidates
+                                .iter()
+                                .find(|i| i.id == *id)
+                                .map(|i| i.state.clone())
+                        })
+                        .unwrap_or_else(|| "todo".to_string()),
+                })
+                .collect())
+        }
+    }
+
+    fn test_issue(id: &str, state: &str) -> Issue {
+        Issue {
+            id: id.to_string(),
+            identifier: format!("T-{id}"),
+            title: String::new(),
+            description: String::new(),
+            labels: vec![],
+            url: String::new(),
+            priority: 1,
+            state: state.to_string(),
+            blocked_by: vec![],
+            assigned_to_worker: true,
+            created_at: Utc::now(),
+        }
+    }
+
+    fn test_store() -> WorkflowStore {
+        let tmp = std::env::temp_dir().join(format!(
+            "symphony_workflow_test_{}_{}.md",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::write(&tmp, "{{ issue.identifier }}\n").unwrap();
+        WorkflowStore::load(&tmp).unwrap()
+    }
 
     #[test]
     fn sorts_by_priority_created_and_identifier() {
@@ -969,5 +1124,236 @@ mod tests {
     fn detects_stall_error_signature() {
         let err = CoreError::Runtime("stalled waiting for app-server events".into());
         assert!(is_stall_error(&err));
+    }
+
+    #[tokio::test]
+    async fn dispatch_skips_issues_in_configured_terminal_states() {
+        let store = test_store();
+
+        let mut settings = Settings::default();
+        settings.tracker.terminal_states = vec!["closed".to_string()];
+
+        let issue = Issue {
+            id: "1".into(),
+            identifier: "T-1".into(),
+            title: "".into(),
+            description: "".into(),
+            labels: vec![],
+            url: "".into(),
+            priority: 1,
+            state: "closed".into(),
+            blocked_by: vec![],
+            assigned_to_worker: true,
+            created_at: Utc::now(),
+        };
+
+        let tracker = StaticTracker {
+            candidates: vec![issue],
+            state_overrides: HashMap::new(),
+        };
+        let mut orch = Orchestrator::new(settings, tracker, store, None).unwrap();
+        orch.tick().await.unwrap();
+        assert!(
+            orch.snapshot().running.is_empty(),
+            "terminal (closed) issue must not be dispatched"
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_does_not_block_on_running_task_completion() {
+        let store = test_store();
+        let mut settings = Settings::default();
+        settings.codex.stall_timeout_ms = 60_000;
+        let tracker = StaticTracker {
+            candidates: vec![],
+            state_overrides: HashMap::new(),
+        };
+        let mut orch = Orchestrator::new(settings, tracker, store, None).unwrap();
+        let issue = test_issue("noblock", "todo");
+        orch.running.insert(
+            issue.id.clone(),
+            RunningWorker {
+                issue_id: issue.id.clone(),
+                issue_identifier: issue.identifier.clone(),
+                issue_state: issue.state.clone(),
+                worker_host: None,
+                workspace_path: PathBuf::from("/tmp/symphony-no-block"),
+                started_at: Utc::now(),
+                last_activity_at: Utc::now(),
+                turns_completed: 0,
+                attempt: 1,
+                stall_restarts: 0,
+            },
+        );
+        orch.claimed.insert(issue.id.clone());
+        orch.run_tasks.insert(
+            issue.id.clone(),
+            tokio::spawn(async move {
+                sleep(Duration::from_millis(250)).await;
+                Ok(IssueRunSummary {
+                    issue,
+                    turns_completed: 1,
+                    last_activity_at: Utc::now(),
+                    usage_tokens: 0,
+                    disposition: RunDisposition::Completed,
+                })
+            }),
+        );
+
+        let started = Instant::now();
+        orch.tick().await.unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "tick should return promptly while run is still active"
+        );
+        assert_eq!(orch.running.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn later_tick_drains_completed_run_and_schedules_retry() {
+        let store = test_store();
+        let mut settings = Settings::default();
+        settings.codex.stall_timeout_ms = 60_000;
+        let tracker = StaticTracker {
+            candidates: vec![],
+            state_overrides: HashMap::new(),
+        };
+        let mut orch = Orchestrator::new(settings, tracker, store, None).unwrap();
+        let issue = test_issue("drain", "todo");
+        orch.running.insert(
+            issue.id.clone(),
+            RunningWorker {
+                issue_id: issue.id.clone(),
+                issue_identifier: issue.identifier.clone(),
+                issue_state: issue.state.clone(),
+                worker_host: None,
+                workspace_path: PathBuf::from("/tmp/symphony-drain"),
+                started_at: Utc::now(),
+                last_activity_at: Utc::now(),
+                turns_completed: 0,
+                attempt: 1,
+                stall_restarts: 0,
+            },
+        );
+        orch.claimed.insert(issue.id.clone());
+        let issue_id = issue.id.clone();
+        orch.run_tasks.insert(
+            issue.id.clone(),
+            tokio::spawn(async move {
+                sleep(Duration::from_millis(20)).await;
+                Ok(IssueRunSummary {
+                    issue,
+                    turns_completed: 1,
+                    last_activity_at: Utc::now(),
+                    usage_tokens: 42,
+                    disposition: RunDisposition::Completed,
+                })
+            }),
+        );
+        sleep(Duration::from_millis(40)).await;
+        orch.tick().await.unwrap();
+        assert!(!orch.running.contains_key(&issue_id));
+        assert!(!orch.claimed.contains(&issue_id));
+        assert!(orch.retries.contains_key(&issue_id));
+    }
+
+    #[tokio::test]
+    async fn cross_tick_stall_schedules_retry_and_aborts_task() {
+        let store = test_store();
+        let mut settings = Settings::default();
+        settings.codex.stall_timeout_ms = 100;
+        let tracker = StaticTracker {
+            candidates: vec![],
+            state_overrides: HashMap::new(),
+        };
+        let mut orch = Orchestrator::new(settings, tracker, store, None).unwrap();
+        let issue = test_issue("stall", "todo");
+        orch.running.insert(
+            issue.id.clone(),
+            RunningWorker {
+                issue_id: issue.id.clone(),
+                issue_identifier: issue.identifier.clone(),
+                issue_state: issue.state.clone(),
+                worker_host: None,
+                workspace_path: PathBuf::from("/tmp/symphony-stall"),
+                started_at: Utc::now(),
+                last_activity_at: Utc::now() - chrono::Duration::milliseconds(500),
+                turns_completed: 0,
+                attempt: 1,
+                stall_restarts: 0,
+            },
+        );
+        orch.claimed.insert(issue.id.clone());
+        orch.run_tasks.insert(
+            issue.id.clone(),
+            tokio::spawn(async move {
+                sleep(Duration::from_secs(10)).await;
+                Ok(IssueRunSummary {
+                    issue: test_issue("stall", "todo"),
+                    turns_completed: 0,
+                    last_activity_at: Utc::now(),
+                    usage_tokens: 0,
+                    disposition: RunDisposition::Completed,
+                })
+            }),
+        );
+
+        orch.reconcile_stalled_running();
+        assert!(!orch.running.contains_key("stall"));
+        assert!(!orch.claimed.contains("stall"));
+        assert!(!orch.run_tasks.contains_key("stall"));
+        let retry = orch.retries.get("stall").expect("stall retry expected");
+        assert!(retry
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("cross-tick inactivity"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_running_state_abort_cleans_supervised_task() {
+        let store = test_store();
+        let mut settings = Settings::default();
+        settings.tracker.terminal_states = vec!["closed".to_string()];
+        let tracker = StaticTracker {
+            candidates: vec![],
+            state_overrides: HashMap::from([("reconcile".to_string(), "closed".to_string())]),
+        };
+        let mut orch = Orchestrator::new(settings, tracker, store, None).unwrap();
+        orch.running.insert(
+            "reconcile".to_string(),
+            RunningWorker {
+                issue_id: "reconcile".to_string(),
+                issue_identifier: "T-reconcile".to_string(),
+                issue_state: "todo".to_string(),
+                worker_host: None,
+                workspace_path: PathBuf::from("/tmp/symphony-reconcile"),
+                started_at: Utc::now(),
+                last_activity_at: Utc::now(),
+                turns_completed: 0,
+                attempt: 1,
+                stall_restarts: 0,
+            },
+        );
+        orch.claimed.insert("reconcile".to_string());
+        orch.run_tasks.insert(
+            "reconcile".to_string(),
+            tokio::spawn(async move {
+                sleep(Duration::from_secs(10)).await;
+                Ok(IssueRunSummary {
+                    issue: test_issue("reconcile", "todo"),
+                    turns_completed: 0,
+                    last_activity_at: Utc::now(),
+                    usage_tokens: 0,
+                    disposition: RunDisposition::Completed,
+                })
+            }),
+        );
+
+        orch.reconcile_running_states().await.unwrap();
+        assert!(!orch.running.contains_key("reconcile"));
+        assert!(!orch.claimed.contains("reconcile"));
+        assert!(!orch.run_tasks.contains_key("reconcile"));
     }
 }

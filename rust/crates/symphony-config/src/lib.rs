@@ -117,6 +117,10 @@ pub struct TrackerConfig {
     pub token: Option<String>,
     #[serde(default, alias = "project_slug")]
     pub project: Option<String>,
+    /// When set, only issues assigned to this Linear user id are routable (`assigned_to_worker`).
+    /// Use `"me"` to resolve the authenticated viewer. Overrides via `$LINEAR_ASSIGNEE`.
+    #[serde(default)]
+    pub assignee: Option<String>,
     #[serde(default = "defaults::active_states")]
     pub active_states: Vec<String>,
     #[serde(default = "defaults::terminal_states")]
@@ -150,6 +154,8 @@ pub struct ObservabilityConfig {
     pub web_dashboard_enabled: bool,
     #[serde(default = "defaults::observability_refresh_ms")]
     pub refresh_ms: u64,
+    #[serde(default)]
+    pub tui_enabled: bool,
 }
 
 /// True when settings (after CLI merge) should bind an observability HTTP server.
@@ -244,6 +250,7 @@ impl Default for TrackerConfig {
             endpoint: None,
             token: None,
             project: None,
+            assignee: None,
             active_states: defaults::active_states(),
             terminal_states: defaults::terminal_states(),
         }
@@ -274,6 +281,7 @@ impl Default for ObservabilityConfig {
             api_enabled: false,
             web_dashboard_enabled: defaults::observability_web_dashboard_enabled(),
             refresh_ms: defaults::observability_refresh_ms(),
+            tui_enabled: false,
         }
     }
 }
@@ -408,6 +416,19 @@ impl Settings {
         self.tracker.endpoint = self.tracker.endpoint.as_deref().map(resolve_env_ref);
         self.tracker.token = self.tracker.token.as_deref().map(resolve_env_ref);
         self.tracker.project = self.tracker.project.as_deref().map(resolve_env_ref);
+        self.tracker.assignee = self
+            .tracker
+            .assignee
+            .as_deref()
+            .map(resolve_env_ref)
+            .and_then(|s| {
+                let t = s.trim();
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t.to_string())
+                }
+            });
     }
 }
 
@@ -652,6 +673,7 @@ codex:
         assert!(!observability_http_enabled(&cfg));
         assert_eq!(cfg.server.port, 0);
         assert!(cfg.observability.web_dashboard_enabled);
+        assert!(!cfg.observability.tui_enabled);
     }
 
     #[test]
@@ -665,6 +687,27 @@ codex:
     }
 
     #[test]
+    fn parses_tracker_assignee_me() {
+        let parsed = Settings::from_workflow_front_matter(Some(
+            r#"
+tracker:
+  assignee: me
+"#,
+        ))
+        .expect("must parse");
+        assert_eq!(parsed.tracker.assignee.as_deref(), Some("me"));
+        parsed.validate().expect("valid");
+    }
+
+    #[test]
+    fn tracker_assignee_blank_env_resolves_to_none() {
+        let mut s = Settings::default();
+        s.tracker.assignee = Some("   ".to_string());
+        s.resolve_env_overrides();
+        assert!(s.tracker.assignee.is_none());
+    }
+
+    #[test]
     fn parses_server_and_observability() {
         let parsed = Settings::from_workflow_front_matter(Some(
             r#"
@@ -675,6 +718,7 @@ observability:
   api_enabled: true
   web_dashboard_enabled: false
   refresh_ms: 5000
+  tui_enabled: true
 runtime:
   require_guardrails_ack: true
 "#,
@@ -685,6 +729,7 @@ runtime:
         assert!(parsed.observability.api_enabled);
         assert!(!parsed.observability.web_dashboard_enabled);
         assert_eq!(parsed.observability.refresh_ms, 5000);
+        assert!(parsed.observability.tui_enabled);
         assert!(parsed.runtime.require_guardrails_ack);
         parsed.validate().expect("valid");
     }
