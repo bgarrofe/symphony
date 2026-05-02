@@ -294,15 +294,9 @@ impl CodexClient {
                     outcome.thread_id = Some(thread_id.clone());
                     let mut turn_params_map = serde_json::Map::from_iter([
                         ("threadId".into(), json!(thread_id)),
-                        (
-                            "input".into(),
-                            json!([{"type":"text","text":input_prompt}]),
-                        ),
+                        ("input".into(), json!([{"type":"text","text":input_prompt}])),
                         ("cwd".into(), json!(workspace_cwd)),
-                        (
-                            "approvalPolicy".into(),
-                            policies.approval_policy.clone(),
-                        ),
+                        ("approvalPolicy".into(), policies.approval_policy.clone()),
                     ]);
                     if let Some(t) = turn_title {
                         turn_params_map.insert("title".into(), json!(t));
@@ -878,6 +872,75 @@ fn maybe_extract_usage(src: &Value, outcome: &mut TurnOutcome) {
     outcome.usage = Some(parsed);
 }
 
+/// Best-effort Codex thread/session id from a stream JSON line (params/result/root).
+pub fn extract_thread_id_from_stream_message(value: &Value) -> Option<String> {
+    extract_thread_start_thread_id(value).or_else(|| {
+        value
+            .get("params")
+            .and_then(|p| maybe_extract_ids_map(p))
+            .or_else(|| value.get("result").and_then(|r| maybe_extract_ids_map(r)))
+            .or_else(|| maybe_extract_ids_map(value))
+    })
+}
+
+fn maybe_extract_ids_map(src: &Value) -> Option<String> {
+    if let Some(t) = src.get("threadId").and_then(Value::as_str) {
+        return Some(t.to_string());
+    }
+    src.get("thread")
+        .and_then(|v| v.get("id"))
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
+}
+
+/// Best-effort rate-limit map embedded in Codex/Cursor JSON (mirrors Elixir deep scan).
+pub fn extract_rate_limits_from_stream_message(value: &Value) -> Option<Value> {
+    rate_limits_from_value(value)
+}
+
+fn rate_limits_from_value(value: &Value) -> Option<Value> {
+    match value {
+        Value::Object(map) => {
+            if let Some(rl) = map.get("rate_limits").or_else(|| map.get("rateLimits")) {
+                if rate_limits_map_like(rl) {
+                    return Some(rl.clone());
+                }
+            }
+            if rate_limits_map_like(value) {
+                return Some(value.clone());
+            }
+            for v in map.values() {
+                if let Some(found) = rate_limits_from_value(v) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Value::Array(items) => {
+            for item in items {
+                if let Some(found) = rate_limits_from_value(item) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn rate_limits_map_like(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            map.contains_key("primary")
+                || map.contains_key("secondary")
+                || map.contains_key("credits")
+                || map.contains_key("limit")
+                || map.contains_key("limit_id")
+        }
+        _ => false,
+    }
+}
+
 /// Human-readable "current step" from an app-server or Cursor-stream JSON line (for dashboards).
 pub fn summarize_turn_stream_message(value: &Value) -> Option<String> {
     if let Some(method) = value.get("method").and_then(Value::as_str) {
@@ -892,13 +955,8 @@ pub fn summarize_turn_stream_message(value: &Value) -> Option<String> {
     match value.get("type").and_then(Value::as_str) {
         Some("turn.delta") => None,
         Some(
-            typ @ ("assistant"
-            | "tool_call"
-            | "tool_result"
-            | "turn.started"
-            | "turn.tool_call"
-            | "turn.tool_result"
-            | "turn.completed"),
+            typ @ ("assistant" | "tool_call" | "tool_result" | "turn.started" | "turn.tool_call"
+            | "turn.tool_result" | "turn.completed"),
         ) => Some(typ.to_string()),
         Some("result") => value
             .get("subtype")
@@ -939,6 +997,36 @@ mod tests {
             classify_approval_prompt(false, &msg),
             Err(CodexError::ApprovalRequired)
         ));
+    }
+
+    #[test]
+    fn extract_rate_limits_finds_nested_map() {
+        let msg = json!({
+            "meta": {
+                "rate_limits": {
+                    "primary": {"limit": 100},
+                    "secondary": {"limit": 50}
+                }
+            }
+        });
+        let rl = extract_rate_limits_from_stream_message(&msg);
+        assert!(rl.is_some());
+        let v = rl.unwrap();
+        assert!(v.get("primary").is_some());
+    }
+
+    #[test]
+    fn extract_thread_id_from_params() {
+        let msg = json!({
+            "params": {
+                "threadId": "thr_stream",
+                "usage": {"totalTokens": 3}
+            }
+        });
+        assert_eq!(
+            extract_thread_id_from_stream_message(&msg).as_deref(),
+            Some("thr_stream")
+        );
     }
 
     #[test]

@@ -1,11 +1,11 @@
 //! HTTP observability API and minimal dashboard (Elixir route parity baseline).
 
 use axum::{
+    Json, Router,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
 };
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
@@ -64,6 +64,14 @@ fn api_error(status: StatusCode, code: &str, message: &str) -> impl IntoResponse
 async fn get_state(State(state): State<ObservabilityState>) -> impl IntoResponse {
     let snap = state.snapshot.read().await;
     let generated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let codex_totals = serde_json::to_value(&snap.codex_totals).unwrap_or_else(|_| {
+        json!({
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": snap.total_tokens,
+            "seconds_running": 0
+        })
+    });
     let response = StateResponse {
         generated_at,
         counts: Counts {
@@ -72,13 +80,8 @@ async fn get_state(State(state): State<ObservabilityState>) -> impl IntoResponse
         },
         running: snap.running.clone(),
         retrying: snap.retrying.clone(),
-        codex_totals: json!({
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "total_tokens": snap.total_tokens,
-            "seconds_running": 0
-        }),
-        rate_limits: json!({}),
+        codex_totals,
+        rate_limits: snap.rate_limits.clone(),
     };
     Json(response)
 }
@@ -96,12 +99,29 @@ async fn post_refresh(State(state): State<ObservabilityState>) -> impl IntoRespo
 }
 
 #[derive(Serialize)]
+struct WorkspaceHost {
+    path: String,
+    host: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AttemptsSummary {
+    restart_count: u32,
+    current_retry_attempt: u32,
+}
+
+#[derive(Serialize)]
 struct IssueResponse {
     issue_identifier: String,
     issue_id: Option<String>,
     status: String,
+    workspace: WorkspaceHost,
+    attempts: AttemptsSummary,
     running: Option<RunningWorker>,
     retry: Option<RetrySnapshot>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    recent_events: Vec<serde_json::Value>,
+    last_error: Option<String>,
 }
 
 async fn get_issue(
@@ -120,12 +140,8 @@ async fn get_issue(
         .find(|r| r.issue_identifier == issue_identifier)
         .cloned();
     if running.is_none() && retry.is_none() {
-        return api_error(
-            StatusCode::NOT_FOUND,
-            "issue_not_found",
-            "Issue not found",
-        )
-        .into_response();
+        return api_error(StatusCode::NOT_FOUND, "issue_not_found", "Issue not found")
+            .into_response();
     }
     let issue_id = running
         .as_ref()
@@ -136,20 +152,52 @@ async fn get_issue(
     } else {
         "retrying".to_string()
     };
+    let workspace_path = running
+        .as_ref()
+        .map(|w| w.workspace_path.display().to_string())
+        .or_else(|| {
+            retry
+                .as_ref()
+                .map(|r| r.workspace_path.display().to_string())
+        })
+        .unwrap_or_default();
+    let workspace_host = running
+        .as_ref()
+        .and_then(|w| w.worker_host.clone())
+        .or_else(|| retry.as_ref().and_then(|r| r.worker_host.clone()));
+    let restart_count = retry
+        .as_ref()
+        .map(|r| r.attempt.saturating_sub(1))
+        .unwrap_or(0);
+    let current_retry_attempt = retry.as_ref().map(|r| r.attempt).unwrap_or(0);
+    let last_error = retry.as_ref().and_then(|r| r.error.clone());
     let body = IssueResponse {
         issue_identifier: issue_identifier.clone(),
         issue_id,
         status,
+        workspace: WorkspaceHost {
+            path: workspace_path,
+            host: workspace_host,
+        },
+        attempts: AttemptsSummary {
+            restart_count,
+            current_retry_attempt,
+        },
         running,
         retry,
+        recent_events: vec![],
+        last_error,
     };
     Json(body).into_response()
 }
 
 async fn dashboard(State(state): State<ObservabilityState>) -> impl IntoResponse {
-    let html = include_str!("dashboard.html")
-        .replace("__REFRESH_MS__", &state.refresh_ms.to_string());
-    ([(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")], html)
+    let html =
+        include_str!("dashboard.html").replace("__REFRESH_MS__", &state.refresh_ms.to_string());
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        html,
+    )
 }
 
 /// TCP server for the observability router (blocks until the process exits or the server errors).
@@ -184,6 +232,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use std::path::PathBuf;
+    use symphony_core::{CodexTotalsSnapshot, WorkerTokenBreakdown};
     use tower::ServiceExt;
 
     fn test_state() -> ObservabilityState {
@@ -203,6 +252,9 @@ mod tests {
                     process_id: None,
                     usage_tokens_this_run: 0,
                     current_step: String::new(),
+                    session_id: None,
+                    tokens: WorkerTokenBreakdown::default(),
+                    last_event_at: None,
                 }],
                 retrying: vec![RetrySnapshot {
                     issue_id: "i2".into(),
@@ -214,6 +266,13 @@ mod tests {
                     error: Some("boom".into()),
                 }],
                 total_tokens: 42,
+                codex_totals: CodexTotalsSnapshot {
+                    input_tokens: 10,
+                    output_tokens: 20,
+                    total_tokens: 42,
+                    seconds_running: 5,
+                },
+                rate_limits: json!({}),
             })),
             refresh: Arc::new(Notify::new()),
             refresh_ms: 3000,

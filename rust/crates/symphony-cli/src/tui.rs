@@ -1,17 +1,19 @@
 use anyhow::Result;
 use chrono::Utc;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
+    Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Cell, Paragraph, Row, Table, TableState},
-    Frame, Terminal,
 };
 use std::io::{self};
 use std::sync::Arc;
@@ -207,8 +209,9 @@ fn running_worker_to_agent(w: &RunningWorker) -> Agent {
         .process_id
         .map(|p| p.to_string())
         .unwrap_or_else(|| "—".to_string());
-    let tokens = if w.usage_tokens_this_run > 0 {
-        format_num(w.usage_tokens_this_run)
+    let tok_n = w.usage_tokens_this_run.max(w.tokens.total_tokens);
+    let tokens = if tok_n > 0 {
+        format_num(tok_n)
     } else {
         "—".to_string()
     };
@@ -224,6 +227,11 @@ fn running_worker_to_agent(w: &RunningWorker) -> Agent {
     } else {
         w.current_step.clone()
     };
+    let session_src = w
+        .session_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(w.issue_id.as_str());
     Agent {
         id: w.issue_identifier.clone(),
         stage: stage_from_issue_state(&w.issue_state),
@@ -231,7 +239,7 @@ fn running_worker_to_agent(w: &RunningWorker) -> Agent {
         age,
         turn,
         tokens,
-        session: truncate(&w.issue_id, 16),
+        session: truncate(session_src, 16),
         event,
     }
 }
@@ -264,16 +272,19 @@ pub async fn run_tui(
                 .as_secs();
 
             let snap = snapshot.read().await.clone();
-            let agents: Vec<Agent> = snap
-                .running
-                .iter()
-                .map(running_worker_to_agent)
-                .collect();
+            let agents: Vec<Agent> = snap.running.iter().map(running_worker_to_agent).collect();
             let table_row_count = if agents.is_empty() { 1 } else { agents.len() };
             anim.clamp_selection(table_row_count);
 
             terminal.draw(|f| {
-                draw(f, &ctx, &agents, &snap.retrying, &mut anim, next_refresh_secs)
+                draw(
+                    f,
+                    &ctx,
+                    &agents,
+                    &snap.retrying,
+                    &mut anim,
+                    next_refresh_secs,
+                )
             })?;
 
             tokio::select! {
@@ -395,7 +406,10 @@ fn draw_status(
                 }
                 let c = agents.iter().filter(|a| a.stage == *st).count();
                 let ch = Style::default().fg(st.color());
-                spans.push(Span::styled(st.short_label(), ch.add_modifier(Modifier::BOLD)));
+                spans.push(Span::styled(
+                    st.short_label(),
+                    ch.add_modifier(Modifier::BOLD),
+                ));
                 spans.push(Span::styled(":", ds));
                 spans.push(Span::styled(c.to_string(), ch));
             }
@@ -442,23 +456,22 @@ fn draw_status(
         ]),
     ];
 
-    f.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(BG)),
-        area,
-    );
+    f.render_widget(Paragraph::new(lines).style(Style::default().bg(BG)), area);
 }
 
 fn draw_table(f: &mut Frame, agents: &[Agent], anim: &mut AnimationState, area: Rect) {
     let header = Row::new(
-        ["ID", "STAGE", "PID", "AGE / TURN", "TOKENS", "SESSION", "EVENT"]
-            .iter()
-            .map(|h| {
-                Cell::from(*h).style(
-                    Style::default()
-                        .fg(HEADER)
-                        .add_modifier(Modifier::BOLD),
-                )
-            }),
+        [
+            "ID",
+            "STAGE",
+            "PID",
+            "AGE / TURN",
+            "TOKENS",
+            "SESSION",
+            "EVENT",
+        ]
+        .iter()
+        .map(|h| Cell::from(*h).style(Style::default().fg(HEADER).add_modifier(Modifier::BOLD))),
     )
     .style(Style::default().bg(BG))
     .height(1);
@@ -486,22 +499,16 @@ fn draw_table(f: &mut Frame, agents: &[Agent], anim: &mut AnimationState, area: 
 
                 Row::new(vec![
                     Cell::from(Line::from(vec![
-                        Span::styled(
-                            "● ",
-                            Style::default().fg(agent.stage.color()),
-                        ),
-                        Span::styled(
-                            truncate(&agent.id, 24),
-                            Style::default().fg(LABEL),
-                        ),
+                        Span::styled("● ", Style::default().fg(agent.stage.color())),
+                        Span::styled(truncate(&agent.id, 24), Style::default().fg(LABEL)),
                     ])),
-                    Cell::from(agent.stage.label())
-                        .style(Style::default().fg(agent.stage.color())),
+                    Cell::from(agent.stage.label()).style(Style::default().fg(agent.stage.color())),
                     Cell::from(agent.pid.clone()).style(Style::default().fg(DIM)),
                     Cell::from(format!("{} / {}", agent.age, agent.turn))
                         .style(Style::default().fg(DIM)),
                     Cell::from(agent.tokens.clone()).style(Style::default().fg(CYAN)),
-                    Cell::from(agent.session.clone()).style(Style::default().fg(Color::Rgb(130, 100, 180))),
+                    Cell::from(agent.session.clone())
+                        .style(Style::default().fg(Color::Rgb(130, 100, 180))),
                     Cell::from(truncate(&agent.event, 96))
                         .style(Style::default().fg(Color::Rgb(180, 180, 180))),
                 ])
@@ -532,15 +539,13 @@ fn draw_table(f: &mut Frame, agents: &[Agent], anim: &mut AnimationState, area: 
 }
 
 fn draw_backoff(f: &mut Frame, retries: &[RetrySnapshot], area: Rect) {
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("─ ", Style::default().fg(DIM)),
-            Span::styled(
-                "Backoff queue",
-                Style::default().fg(LABEL).add_modifier(Modifier::BOLD),
-            ),
-        ]),
-    ];
+    let mut lines = vec![Line::from(vec![
+        Span::styled("─ ", Style::default().fg(DIM)),
+        Span::styled(
+            "Backoff queue",
+            Style::default().fg(LABEL).add_modifier(Modifier::BOLD),
+        ),
+    ])];
     if retries.is_empty() {
         lines.push(Line::from(Span::styled(
             "  No queued retries",
@@ -559,10 +564,7 @@ fn draw_backoff(f: &mut Frame, retries: &[RetrySnapshot], area: Rect) {
             ]));
         }
     }
-    f.render_widget(
-        Paragraph::new(lines).style(Style::default().bg(BG)),
-        area,
-    );
+    f.render_widget(Paragraph::new(lines).style(Style::default().bg(BG)), area);
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {

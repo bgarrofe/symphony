@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
-use symphony_config::{observability_http_enabled, workflow_path, Settings};
+use symphony_config::{Settings, observability_http_enabled, workflow_path};
 use symphony_core::Orchestrator;
 use symphony_core::OrchestratorSnapshot;
 use symphony_observability::ObservabilityState;
@@ -12,12 +12,13 @@ use symphony_workflow::WorkflowStore;
 use tokio::sync::{Notify, RwLock};
 use tokio::time::{Duration, sleep};
 use tracing::{error, info};
-use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::prelude::*;
 
 mod tui;
 
-const GUARDRAILS_ACK_LONG: &str = "i-understand-that-this-will-be-running-without-the-usual-guardrails";
+const GUARDRAILS_ACK_LONG: &str =
+    "i-understand-that-this-will-be-running-without-the-usual-guardrails";
 
 #[derive(Clone)]
 struct MemoryTracker {
@@ -45,6 +46,18 @@ impl Tracker for MemoryTracker {
                 state: i.state.clone(),
             })
             .collect())
+    }
+
+    async fn create_comment(&self, _issue_id: &str, _body: &str) -> Result<(), TrackerError> {
+        Ok(())
+    }
+
+    async fn update_issue_state(
+        &self,
+        _issue_id: &str,
+        _state_name: &str,
+    ) -> Result<(), TrackerError> {
+        Ok(())
     }
 }
 
@@ -135,7 +148,9 @@ async fn main() -> Result<()> {
             settings.server.host = h.trim().to_string();
         }
     }
-    settings.validate().map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    settings
+        .validate()
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
     if settings.runtime.require_guardrails_ack && !cli.guardrails_ack {
         eprint!("{}", guardrails_banner());
@@ -159,11 +174,7 @@ async fn main() -> Result<()> {
     };
 
     if http_enabled {
-        let addr_str = format!(
-            "{}:{}",
-            settings.server.host.trim(),
-            settings.server.port
-        );
+        let addr_str = format!("{}:{}", settings.server.host.trim(), settings.server.port);
         let addr = addr_str
             .parse()
             .with_context(|| format!("invalid bind address: {addr_str}"))?;
@@ -231,7 +242,12 @@ async fn main() -> Result<()> {
 }
 
 fn linear_project_url(settings: &Settings) -> Option<String> {
-    let endpoint = settings.tracker.endpoint.as_deref()?.trim().trim_end_matches('/');
+    let endpoint = settings
+        .tracker
+        .endpoint
+        .as_deref()?
+        .trim()
+        .trim_end_matches('/');
     let project = settings.tracker.project.as_deref()?.trim();
     if endpoint.is_empty() || project.is_empty() {
         return None;

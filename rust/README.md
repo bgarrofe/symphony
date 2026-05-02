@@ -34,9 +34,8 @@ Implemented:
 
 Not yet complete:
 
-- Full one-to-one parity with all Elixir runtime semantics
+- Full one-to-one parity with all Elixir runtime semantics (e.g. Phoenix LiveView push UX)
 - Full acceptance test matrix from `SPEC.md`
-- Parity gaps for observability JSON (per-issue Codex session fields, live rate limits) — see Observability section
 - **SSH remote execution**: `worker.ssh_hosts` and per-host limits are enforced for **scheduling/capacity**; the Rust runtime still launches Codex/Cursor **locally** in the workspace (remote process launch is not wired yet).
 
 ---
@@ -221,14 +220,22 @@ When `server.port > 0` (after config + CLI merge), the CLI spawns **`symphony-ob
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/v1/state` | JSON snapshot: `generated_at`, `counts`, `running`, `retrying`, `codex_totals` (subset), `rate_limits` (empty object). |
+| `GET` | `/api/v1/state` | JSON snapshot: `generated_at`, `counts`, `running`, `retrying`, `codex_totals`, `rate_limits`. |
 | `POST` | `/api/v1/refresh` | `202` — wakes the poll loop so the next orchestrator tick runs without waiting the full `polling.interval_ms`. |
 | `GET` | `/api/v1/{issue_identifier}` | Single-issue aggregate; `404` with `{ "error": { "code", "message" } }` if not running or retrying. |
 | `GET` | `/` | Minimal HTML dashboard (only if `observability.web_dashboard_enabled` is true). |
 
-**Stale snapshots:** the orchestrator publishes into a shared `RwLock<OrchestratorSnapshot>` after dispatch is scheduled (issues appear in `running`) and again after the tick finishes. While Codex work is in flight inside a tick, HTTP readers see the last published copy; `turns_completed` and similar fields may lag until the tick completes. This avoids holding a lock across long-running agent I/O.
+**Stale snapshots:** the orchestrator publishes into a shared `RwLock<OrchestratorSnapshot>` after dispatch is scheduled (issues appear in `running`) and again after the tick finishes. Issue runs execute concurrently across ticks; HTTP readers still see the last published copy until the next `publish_snapshot`, so very rapid stream-derived fields may lag slightly between ticks.
 
-**JSON parity vs Elixir:** running rows use Rust field names (e.g. `issue_state` instead of Elixir’s `state`); per-issue Codex session telemetry (`session_id`, token breakdown per turn, `last_event`) is not wired in this baseline. `codex_totals` exposes aggregate `total_tokens` with other counters zero-filled until deeper instrumentation exists.
+**`codex_totals`:** `input_tokens`, `output_tokens`, and `total_tokens` combine (a) usage accumulated from **completed** issue runs and (b) live usage parsed from in-flight Codex streams. **`seconds_running`** is wall-clock time while at least one worker is in `running` (accumulated across idle gaps when the fleet goes quiet).
+
+**`rate_limits`:** Best-effort map extracted when Codex embeds rate-limit metadata in stream JSON; `{}` when unknown.
+
+**Cross-tick stall (`codex.stall_timeout_ms`):** Inactivity is judged from the later of `RunningWorker.last_activity_at` and the last Codex stream timestamp for that issue (so steady streaming resets the stall timer).
+
+**JSON vs Elixir naming:** Running rows still use Rust field names (e.g. `issue_state`, `session_id` for Codex thread id, `tokens` for `{ input_tokens, output_tokens, total_tokens }`, `last_event_at`, `current_step`). Elixir’s `state` / `last_event` naming differs; clients should key off documented Rust fields.
+
+**Per-issue route `GET /api/v1/{issue_identifier}`** includes `workspace` (`path`, `host`), `attempts` (`restart_count`, `current_retry_attempt`), `last_error`, and `recent_events` (currently an empty array placeholder).
 
 ## Observability (TUI)
 
@@ -290,6 +297,7 @@ Defines required tracker operations:
 - `fetch_candidate_issues`
 - `fetch_issues_by_states`
 - `fetch_issue_states_by_ids`
+- `create_comment` / `update_issue_state` (Linear-backed mutations; memory tracker no-ops)
 
 ### Linear Adapter (`symphony-tracker-linear`)
 
@@ -301,6 +309,7 @@ Behavior aligned with the Elixir reference:
 - **Batched id lookups:** `fetch_issue_states_by_ids` uses targeted `issues(filter: { id: { in: $ids } })` queries in batches of 50, preserving the caller’s id order in the result (matching Elixir batching).
 - **Assignee routing:** when `tracker.assignee` is set, issues include Linear `assignee { id }`; `assigned_to_worker` is true only when that id matches the configured filter (or the resolved viewer id for `me`).
 - **Auth fallback:** requests send `Authorization: <token>` first and retry with `Bearer <token>` on `401`, consistent with previous Rust behavior.
+- **Mutations:** `create_comment` and `update_issue_state` mirror the Elixir Linear adapter GraphQL (`commentCreate`, `issueUpdate` with team state resolution)—for programmatic callers; the orchestrator does not post comments by itself.
 
 Recommended environment variables for workflow front matter:
 

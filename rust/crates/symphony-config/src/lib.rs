@@ -639,10 +639,7 @@ codex:
         ))
         .expect("must parse");
         assert_eq!(parsed.worker.ssh_hosts.len(), 2);
-        assert_eq!(
-            parsed.worker.max_concurrent_agents_per_host,
-            Some(2)
-        );
+        assert_eq!(parsed.worker.max_concurrent_agents_per_host, Some(2));
         assert_eq!(parsed.agent.max_retry_backoff_ms, 120_000);
         assert_eq!(
             *parsed

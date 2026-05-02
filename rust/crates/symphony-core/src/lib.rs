@@ -11,13 +11,23 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
 use tracing::{error, info};
 
-use symphony_codex::{CodexClient, CodexSessionPolicies, CursorCliClient, DynamicToolContext, LinearGraphqlTool};
+use symphony_codex::{
+    CodexClient, CodexSessionPolicies, CursorCliClient, DynamicToolContext, LinearGraphqlTool,
+    Usage,
+};
 use symphony_config::Settings;
 use symphony_tracker::{Issue, Tracker, TrackerError};
 use symphony_workflow::{PromptContext, WorkflowStore};
 use symphony_workspace::{
     HookSet, create_workspace, remove_workspace, run_hook, sanitize_issue_identifier,
 };
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct WorkerTokenBreakdown {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RunningWorker {
@@ -38,6 +48,14 @@ pub struct RunningWorker {
     pub usage_tokens_this_run: u64,
     /// Last meaningful app-server / stream event (mirrors detailed JSON-RPC or stream `type`).
     pub current_step: String,
+    /// Codex thread id when observed on the stream (Elixir `session_id`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub tokens: WorkerTokenBreakdown,
+    /// Wall-clock last stream activity (merged from live stream observer).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_event_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +95,7 @@ struct IssueRunSummary {
     turns_completed: u32,
     last_activity_at: DateTime<Utc>,
     usage_tokens: u64,
+    usage_breakdown: Option<Usage>,
     disposition: RunDisposition,
 }
 
@@ -87,10 +106,21 @@ struct RunCompletion {
 }
 
 #[derive(Debug, Default, Clone, Serialize)]
+pub struct CodexTotalsSnapshot {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    /// Wall-clock seconds Codex has had at least one running worker (see README).
+    pub seconds_running: u64,
+}
+
+#[derive(Debug, Default, Clone, Serialize)]
 pub struct OrchestratorSnapshot {
     pub running: Vec<RunningWorker>,
     pub retrying: Vec<RetrySnapshot>,
     pub total_tokens: u64,
+    pub codex_totals: CodexTotalsSnapshot,
+    pub rate_limits: serde_json::Value,
 }
 
 #[derive(Debug, Error)]
@@ -105,11 +135,27 @@ pub enum CoreError {
     Runtime(String),
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 struct WorkerLiveState {
     process_id: Option<u32>,
     usage_tokens: u64,
     current_step: String,
+    last_stream_at: Option<DateTime<Utc>>,
+    usage_detail: Option<Usage>,
+    session_id: Option<String>,
+}
+
+impl Default for WorkerLiveState {
+    fn default() -> Self {
+        Self {
+            process_id: None,
+            usage_tokens: 0,
+            current_step: String::new(),
+            last_stream_at: None,
+            usage_detail: None,
+            session_id: None,
+        }
+    }
 }
 
 pub struct Orchestrator<T: Tracker> {
@@ -123,10 +169,19 @@ pub struct Orchestrator<T: Tracker> {
     retry_worker_pref: HashMap<String, Option<String>>,
     run_tasks: HashMap<String, JoinHandle<Result<IssueRunSummary, CoreError>>>,
     total_tokens: u64,
+    codex_completed_input: u64,
+    codex_completed_output: u64,
+    codex_completed_total: u64,
+    /// Monotonic instant when first worker started while idle; cleared when running becomes empty.
+    busy_since: Option<Instant>,
+    /// Accumulated `seconds_running` across idle gaps (see [`CodexTotalsSnapshot::seconds_running`]).
+    seconds_running_bank: u64,
     retry_token_seq: u64,
     snapshot_publisher: Option<Arc<RwLock<OrchestratorSnapshot>>>,
     /// Live Codex/Cursor stream fields keyed by issue id (merged into [`OrchestratorSnapshot`] only).
     worker_live: Arc<Mutex<HashMap<String, WorkerLiveState>>>,
+    /// Latest Codex-embedded rate limits map from stream (best effort).
+    rate_limits_live: Arc<Mutex<serde_json::Value>>,
 }
 
 impl<T: Tracker> Orchestrator<T> {
@@ -149,9 +204,15 @@ impl<T: Tracker> Orchestrator<T> {
             retry_worker_pref: HashMap::new(),
             run_tasks: HashMap::new(),
             total_tokens: 0,
+            codex_completed_input: 0,
+            codex_completed_output: 0,
+            codex_completed_total: 0,
+            busy_since: None,
+            seconds_running_bank: 0,
             retry_token_seq: 0,
             snapshot_publisher,
             worker_live: Arc::new(Mutex::new(HashMap::new())),
+            rate_limits_live: Arc::new(Mutex::new(serde_json::json!({}))),
         })
     }
 
@@ -161,12 +222,14 @@ impl<T: Tracker> Orchestrator<T> {
 
     pub fn snapshot(&self) -> OrchestratorSnapshot {
         let live = self.worker_live.lock().unwrap();
+        let rate_limits = self.rate_limits_live.lock().unwrap().clone();
         let running: Vec<RunningWorker> = self
             .running
             .values()
             .cloned()
             .map(|w| merge_running_worker_live(w, &live))
             .collect();
+        let codex_totals = self.build_codex_totals_snapshot(&live);
         OrchestratorSnapshot {
             running,
             retrying: self
@@ -175,6 +238,55 @@ impl<T: Tracker> Orchestrator<T> {
                 .map(|(issue_id, entry)| retry_entry_to_snapshot(issue_id, entry))
                 .collect(),
             total_tokens: self.total_tokens,
+            codex_totals,
+            rate_limits,
+        }
+    }
+
+    fn wall_seconds_running(&self) -> u64 {
+        let mut s = self.seconds_running_bank;
+        if let Some(start) = self.busy_since {
+            s = s.saturating_add(Instant::now().duration_since(start).as_secs());
+        }
+        s
+    }
+
+    fn build_codex_totals_snapshot(
+        &self,
+        live: &HashMap<String, WorkerLiveState>,
+    ) -> CodexTotalsSnapshot {
+        let mut input_tokens = self.codex_completed_input;
+        let mut output_tokens = self.codex_completed_output;
+        let mut total_tokens = self.codex_completed_total;
+        for w in self.running.values() {
+            if let Some(u) = live.get(&w.issue_id).and_then(|x| x.usage_detail.as_ref()) {
+                input_tokens = input_tokens.saturating_add(u.input_tokens);
+                output_tokens = output_tokens.saturating_add(u.output_tokens);
+                total_tokens = total_tokens.saturating_add(u.total_tokens);
+            }
+        }
+        CodexTotalsSnapshot {
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            seconds_running: self.wall_seconds_running(),
+        }
+    }
+
+    fn finalize_busy_if_idle(&mut self) {
+        if !self.running.is_empty() {
+            return;
+        }
+        if let Some(start) = self.busy_since.take() {
+            self.seconds_running_bank = self
+                .seconds_running_bank
+                .saturating_add(Instant::now().duration_since(start).as_secs());
+        }
+    }
+
+    fn note_busy_started(&mut self) {
+        if self.busy_since.is_none() && !self.running.is_empty() {
+            self.busy_since = Some(Instant::now());
         }
     }
 
@@ -199,9 +311,7 @@ impl<T: Tracker> Orchestrator<T> {
             "fetched candidate issues"
         );
 
-        if self.running.len()
-            >= self.settings.agent.max_concurrent_agents as usize
-        {
+        if self.running.len() >= self.settings.agent.max_concurrent_agents as usize {
             info!(
                 max_concurrency = self.settings.agent.max_concurrent_agents,
                 "no dispatch capacity available this tick"
@@ -260,8 +370,12 @@ impl<T: Tracker> Orchestrator<T> {
                     process_id: None,
                     usage_tokens_this_run: 0,
                     current_step: String::new(),
+                    session_id: None,
+                    tokens: WorkerTokenBreakdown::default(),
+                    last_event_at: None,
                 },
             );
+            self.note_busy_started();
             self.spawn_issue_run(issue, retry_attempt);
         }
 
@@ -276,8 +390,17 @@ impl<T: Tracker> Orchestrator<T> {
         let workflow_store = self.workflow_store.clone();
         let issue_id = issue.id.clone();
         let worker_live = self.worker_live.clone();
+        let rate_limits_live = self.rate_limits_live.clone();
         let handle = tokio::spawn(async move {
-            run_issue_once(settings, workflow_store, issue, retry_attempt, worker_live).await
+            run_issue_once(
+                settings,
+                workflow_store,
+                issue,
+                retry_attempt,
+                worker_live,
+                rate_limits_live,
+            )
+            .await
         });
         self.run_tasks.insert(issue_id, handle);
     }
@@ -296,9 +419,7 @@ impl<T: Tracker> Orchestrator<T> {
                 Ok(result) => RunCompletion { issue_id, result },
                 Err(err) => RunCompletion {
                     issue_id,
-                    result: Err(CoreError::Runtime(format!(
-                        "issue task join failed: {err}"
-                    ))),
+                    result: Err(CoreError::Runtime(format!("issue task join failed: {err}"))),
                 },
             };
             self.apply_run_completion(completion);
@@ -314,7 +435,27 @@ impl<T: Tracker> Orchestrator<T> {
         };
         match completion.result {
             Ok(summary) => {
-                self.total_tokens = self.total_tokens.saturating_add(summary.usage_tokens);
+                let usage_credit = summary.usage_breakdown.clone().or_else(|| {
+                    self.worker_live
+                        .lock()
+                        .unwrap()
+                        .get(&issue_id)
+                        .and_then(|w| w.usage_detail.clone())
+                });
+                if let Some(u) = usage_credit {
+                    self.total_tokens = self.total_tokens.saturating_add(u.total_tokens);
+                    self.codex_completed_input =
+                        self.codex_completed_input.saturating_add(u.input_tokens);
+                    self.codex_completed_output =
+                        self.codex_completed_output.saturating_add(u.output_tokens);
+                    self.codex_completed_total =
+                        self.codex_completed_total.saturating_add(u.total_tokens);
+                } else {
+                    self.total_tokens = self.total_tokens.saturating_add(summary.usage_tokens);
+                    self.codex_completed_total = self
+                        .codex_completed_total
+                        .saturating_add(summary.usage_tokens);
+                }
                 if let Some(worker) = self.running.get_mut(&summary.issue.id) {
                     worker.turns_completed = summary.turns_completed;
                     worker.last_activity_at = summary.last_activity_at;
@@ -340,10 +481,15 @@ impl<T: Tracker> Orchestrator<T> {
             Err(err) => {
                 error!(issue=%worker_snapshot.issue_identifier, error=%err, "issue task failed unexpectedly");
                 let issue = issue_from_running_worker(&worker_snapshot);
-                self.enqueue_failure_retry(&issue, worker_snapshot.worker_host.clone(), Some(err.to_string()));
+                self.enqueue_failure_retry(
+                    &issue,
+                    worker_snapshot.worker_host.clone(),
+                    Some(err.to_string()),
+                );
             }
         }
         self.running.remove(&issue_id);
+        self.finalize_busy_if_idle();
         self.claimed.remove(&issue_id);
         self.drop_worker_live(&issue_id);
     }
@@ -472,15 +618,20 @@ impl<T: Tracker> Orchestrator<T> {
         }
         let timeout_ms_i64 = i64::try_from(timeout_ms).unwrap_or(i64::MAX);
         let now = Utc::now();
+        let live = self.worker_live.lock().unwrap();
         let stalled_ids: Vec<String> = self
             .running
             .values()
             .filter(|worker| {
-                now.signed_duration_since(worker.last_activity_at).num_milliseconds()
-                    > timeout_ms_i64
+                let stream_at = live.get(&worker.issue_id).and_then(|s| s.last_stream_at);
+                let effective = stream_at
+                    .map(|t| t.max(worker.last_activity_at))
+                    .unwrap_or(worker.last_activity_at);
+                now.signed_duration_since(effective).num_milliseconds() > timeout_ms_i64
             })
             .map(|worker| worker.issue_id.clone())
             .collect();
+        drop(live);
         for issue_id in stalled_ids {
             if let Some(handle) = self.run_tasks.remove(&issue_id) {
                 handle.abort();
@@ -494,6 +645,7 @@ impl<T: Tracker> Orchestrator<T> {
                 self.enqueue_stall_retry(&issue, worker.worker_host.clone(), Some(reason));
                 self.claimed.remove(&issue_id);
                 self.drop_worker_live(&issue_id);
+                self.finalize_busy_if_idle();
             }
         }
     }
@@ -532,6 +684,7 @@ impl<T: Tracker> Orchestrator<T> {
                 info!(issue=%worker.issue_identifier, "reconciled running issue no longer active");
                 self.claimed.remove(&issue_id);
                 self.drop_worker_live(&issue_id);
+                self.finalize_busy_if_idle();
                 self.cleanup_workspace_with_hooks(&worker.workspace_path)
                     .await?;
             }
@@ -689,9 +842,19 @@ fn merge_running_worker_live(
             worker.process_id = s.process_id;
         }
         worker.usage_tokens_this_run = s.usage_tokens;
+        if let Some(ref u) = s.usage_detail {
+            worker.tokens = WorkerTokenBreakdown {
+                input_tokens: u.input_tokens,
+                output_tokens: u.output_tokens,
+                total_tokens: u.total_tokens,
+            };
+            worker.usage_tokens_this_run = worker.usage_tokens_this_run.max(u.total_tokens);
+        }
         if !s.current_step.is_empty() {
             worker.current_step = s.current_step.clone();
         }
+        worker.session_id = s.session_id.clone().or(worker.session_id.clone());
+        worker.last_event_at = s.last_stream_at.or(worker.last_event_at);
     }
     worker
 }
@@ -718,8 +881,7 @@ fn due_instant_wall_rfc3339(deadline: Instant) -> String {
         Utc::now()
     } else {
         let d = deadline.duration_since(now_i);
-        Utc::now()
-            + chrono::Duration::from_std(d).unwrap_or_else(|_| chrono::Duration::zero())
+        Utc::now() + chrono::Duration::from_std(d).unwrap_or_else(|_| chrono::Duration::zero())
     };
     utc.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
@@ -730,6 +892,7 @@ async fn run_issue_once(
     issue: Issue,
     attempt: u32,
     worker_live: Arc<Mutex<HashMap<String, WorkerLiveState>>>,
+    rate_limits_live: Arc<Mutex<serde_json::Value>>,
 ) -> Result<IssueRunSummary, CoreError> {
     info!(issue=%issue.identifier, "starting issue run");
     let workspace_root = PathBuf::from(&settings.workspace.root);
@@ -757,6 +920,7 @@ async fn run_issue_once(
 
     let mut turns_completed = 0_u32;
     let mut usage_tokens = 0_u64;
+    let mut last_usage_breakdown: Option<Usage> = None;
     let mut last_activity_at = Utc::now();
     let mut disposition = RunDisposition::Completed;
 
@@ -827,6 +991,7 @@ async fn run_issue_once(
             &rendered,
             tool_context,
             worker_live.clone(),
+            rate_limits_live.clone(),
         )
         .await;
         match turn {
@@ -842,6 +1007,7 @@ async fn run_issue_once(
                 );
                 if let Some(usage) = turn.usage {
                     usage_tokens = usage_tokens.saturating_add(usage.total_tokens);
+                    last_usage_breakdown = Some(usage);
                 }
                 let status = turn.status.to_ascii_lowercase();
                 if status == "failed" || status == "cancelled" || status == "canceled" {
@@ -882,6 +1048,7 @@ async fn run_issue_once(
         turns_completed,
         last_activity_at,
         usage_tokens,
+        usage_breakdown: last_usage_breakdown,
         disposition,
     })
 }
@@ -889,17 +1056,34 @@ async fn run_issue_once(
 fn codex_stream_observer(
     issue_id: String,
     worker_live: Arc<Mutex<HashMap<String, WorkerLiveState>>>,
+    rate_limits_live: Arc<Mutex<serde_json::Value>>,
 ) -> Option<symphony_codex::TurnStreamObserver> {
     Some(Arc::new(move |value: &serde_json::Value| {
+        if let Some(rl) = symphony_codex::extract_rate_limits_from_stream_message(value) {
+            if let Ok(mut guard) = rate_limits_live.lock() {
+                *guard = rl;
+            }
+        }
         let Ok(mut guard) = worker_live.lock() else {
             return;
         };
         let row = guard.entry(issue_id.clone()).or_default();
+        row.last_stream_at = Some(Utc::now());
         if let Some(u) = symphony_codex::extract_usage_from_stream_message(value) {
             row.usage_tokens = row.usage_tokens.max(u.total_tokens);
+            let replace = match &row.usage_detail {
+                None => true,
+                Some(prev) => u.total_tokens >= prev.total_tokens,
+            };
+            if replace {
+                row.usage_detail = Some(u);
+            }
         }
         if let Some(step) = symphony_codex::summarize_turn_stream_message(value) {
             row.current_step = step;
+        }
+        if let Some(tid) = symphony_codex::extract_thread_id_from_stream_message(value) {
+            row.session_id = Some(tid);
         }
     }))
 }
@@ -911,6 +1095,7 @@ async fn execute_turn(
     rendered: &str,
     tool_context: DynamicToolContext,
     worker_live: Arc<Mutex<HashMap<String, WorkerLiveState>>>,
+    rate_limits_live: Arc<Mutex<serde_json::Value>>,
 ) -> Result<symphony_codex::TurnOutcome, CoreError> {
     let cwd = workspace_path.display().to_string();
     let policies = CodexSessionPolicies {
@@ -919,7 +1104,11 @@ async fn execute_turn(
         turn_sandbox_policy: settings.codex.turn_sandbox_policy.clone(),
     };
     let turn_title = Some(format!("{}: {}", issue.identifier, issue.title));
-    let stream_observer = codex_stream_observer(issue.id.clone(), worker_live.clone());
+    let stream_observer = codex_stream_observer(
+        issue.id.clone(),
+        worker_live.clone(),
+        rate_limits_live.clone(),
+    );
     if settings
         .runtime
         .interface
@@ -1049,7 +1238,10 @@ mod tests {
             Ok(self.candidates.clone())
         }
 
-        async fn fetch_issues_by_states(&self, states: &[String]) -> Result<Vec<Issue>, TrackerError> {
+        async fn fetch_issues_by_states(
+            &self,
+            states: &[String],
+        ) -> Result<Vec<Issue>, TrackerError> {
             Ok(self
                 .candidates
                 .iter()
@@ -1079,6 +1271,18 @@ mod tests {
                         .unwrap_or_else(|| "todo".to_string()),
                 })
                 .collect())
+        }
+
+        async fn create_comment(&self, _issue_id: &str, _body: &str) -> Result<(), TrackerError> {
+            Ok(())
+        }
+
+        async fn update_issue_state(
+            &self,
+            _issue_id: &str,
+            _state_name: &str,
+        ) -> Result<(), TrackerError> {
+            Ok(())
         }
     }
 
@@ -1286,6 +1490,9 @@ mod tests {
                 process_id: None,
                 usage_tokens_this_run: 0,
                 current_step: String::new(),
+                session_id: None,
+                tokens: WorkerTokenBreakdown::default(),
+                last_event_at: None,
             },
         );
         orch.claimed.insert(issue.id.clone());
@@ -1298,6 +1505,7 @@ mod tests {
                     turns_completed: 1,
                     last_activity_at: Utc::now(),
                     usage_tokens: 0,
+                    usage_breakdown: None,
                     disposition: RunDisposition::Completed,
                 })
             }),
@@ -1340,6 +1548,9 @@ mod tests {
                 process_id: None,
                 usage_tokens_this_run: 0,
                 current_step: String::new(),
+                session_id: None,
+                tokens: WorkerTokenBreakdown::default(),
+                last_event_at: None,
             },
         );
         orch.claimed.insert(issue.id.clone());
@@ -1353,6 +1564,11 @@ mod tests {
                     turns_completed: 1,
                     last_activity_at: Utc::now(),
                     usage_tokens: 42,
+                    usage_breakdown: Some(Usage {
+                        input_tokens: 10,
+                        output_tokens: 32,
+                        total_tokens: 42,
+                    }),
                     disposition: RunDisposition::Completed,
                 })
             }),
@@ -1391,6 +1607,9 @@ mod tests {
                 process_id: None,
                 usage_tokens_this_run: 0,
                 current_step: String::new(),
+                session_id: None,
+                tokens: WorkerTokenBreakdown::default(),
+                last_event_at: None,
             },
         );
         orch.claimed.insert(issue.id.clone());
@@ -1403,6 +1622,7 @@ mod tests {
                     turns_completed: 0,
                     last_activity_at: Utc::now(),
                     usage_tokens: 0,
+                    usage_breakdown: None,
                     disposition: RunDisposition::Completed,
                 })
             }),
@@ -1413,11 +1633,58 @@ mod tests {
         assert!(!orch.claimed.contains("stall"));
         assert!(!orch.run_tasks.contains_key("stall"));
         let retry = orch.retries.get("stall").expect("stall retry expected");
-        assert!(retry
-            .last_error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("cross-tick inactivity"));
+        assert!(
+            retry
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cross-tick inactivity")
+        );
+    }
+
+    #[test]
+    fn cross_tick_recent_stream_avoids_stall() {
+        let store = test_store();
+        let mut settings = Settings::default();
+        settings.codex.stall_timeout_ms = 100;
+        let tracker = StaticTracker {
+            candidates: vec![],
+            state_overrides: HashMap::new(),
+        };
+        let mut orch = Orchestrator::new(settings, tracker, store, None).unwrap();
+        let issue = test_issue("fresh-stream", "todo");
+        orch.running.insert(
+            issue.id.clone(),
+            RunningWorker {
+                issue_id: issue.id.clone(),
+                issue_identifier: issue.identifier.clone(),
+                issue_state: issue.state.clone(),
+                worker_host: None,
+                workspace_path: PathBuf::from("/tmp/symphony-stream"),
+                started_at: Utc::now(),
+                last_activity_at: Utc::now() - chrono::Duration::milliseconds(500),
+                turns_completed: 0,
+                attempt: 1,
+                stall_restarts: 0,
+                process_id: None,
+                usage_tokens_this_run: 0,
+                current_step: String::new(),
+                session_id: None,
+                tokens: WorkerTokenBreakdown::default(),
+                last_event_at: None,
+            },
+        );
+        orch.worker_live.lock().unwrap().insert(
+            issue.id.clone(),
+            WorkerLiveState {
+                last_stream_at: Some(Utc::now()),
+                ..Default::default()
+            },
+        );
+        orch.claimed.insert(issue.id.clone());
+
+        orch.reconcile_stalled_running();
+        assert!(orch.running.contains_key("fresh-stream"));
     }
 
     #[tokio::test]
@@ -1446,6 +1713,9 @@ mod tests {
                 process_id: None,
                 usage_tokens_this_run: 0,
                 current_step: String::new(),
+                session_id: None,
+                tokens: WorkerTokenBreakdown::default(),
+                last_event_at: None,
             },
         );
         orch.claimed.insert("reconcile".to_string());
@@ -1458,6 +1728,7 @@ mod tests {
                     turns_completed: 0,
                     last_activity_at: Utc::now(),
                     usage_tokens: 0,
+                    usage_breakdown: None,
                     disposition: RunDisposition::Completed,
                 })
             }),

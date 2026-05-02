@@ -249,9 +249,10 @@ impl LinearTracker {
 
     async fn effective_assignee_filter(&self) -> Result<Option<AssigneeFilter>, TrackerError> {
         {
-            let guard = self.assignee_cache.lock().map_err(|_| {
-                TrackerError::Config("linear_assignee_cache_poisoned".to_string())
-            })?;
+            let guard = self
+                .assignee_cache
+                .lock()
+                .map_err(|_| TrackerError::Config("linear_assignee_cache_poisoned".to_string()))?;
             if let AssigneeCache::Resolved(opt) = &*guard {
                 return Ok(opt.clone());
             }
@@ -259,15 +260,21 @@ impl LinearTracker {
 
         let resolved = self.resolve_assignee_filter_once().await?;
 
-        let mut guard = self.assignee_cache.lock().map_err(|_| {
-            TrackerError::Config("linear_assignee_cache_poisoned".to_string())
-        })?;
+        let mut guard = self
+            .assignee_cache
+            .lock()
+            .map_err(|_| TrackerError::Config("linear_assignee_cache_poisoned".to_string()))?;
         *guard = AssigneeCache::Resolved(resolved.clone());
         Ok(resolved)
     }
 
     async fn resolve_assignee_filter_once(&self) -> Result<Option<AssigneeFilter>, TrackerError> {
-        let Some(raw) = self.assignee.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+        let Some(raw) = self
+            .assignee
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        else {
             return Ok(None);
         };
 
@@ -316,7 +323,11 @@ query SymphonyLinearViewer {
         let mut acc: Vec<Issue> = Vec::new();
 
         loop {
-            let variables = if self.project.as_deref().is_some_and(|p| !p.trim().is_empty()) {
+            let variables = if self
+                .project
+                .as_deref()
+                .is_some_and(|p| !p.trim().is_empty())
+            {
                 let slug = self.project.clone().unwrap();
                 json!({
                     "projectSlug": slug,
@@ -334,7 +345,11 @@ query SymphonyLinearViewer {
                 })
             };
 
-            let query = if self.project.as_deref().is_some_and(|p| !p.trim().is_empty()) {
+            let query = if self
+                .project
+                .as_deref()
+                .is_some_and(|p| !p.trim().is_empty())
+            {
                 r#"
 query SymphonyLinearPollProject($projectSlug: String!, $stateNames: [String!]!, $first: Int!, $relationFirst: Int!, $after: String) {
   issues(filter: { project: { slugId: { eq: $projectSlug } }, state: { name: { in: $stateNames } } }, first: $first, after: $after) {
@@ -408,11 +423,7 @@ query SymphonyLinearPollNoProject($stateNames: [String!]!, $first: Int!, $relati
             }
 
             if page.issues.page_info.has_next_page {
-                let cursor = page
-                    .issues
-                    .page_info
-                    .end_cursor
-                    .filter(|c| !c.is_empty());
+                let cursor = page.issues.page_info.end_cursor.filter(|c| !c.is_empty());
                 match cursor {
                     Some(c) => after = Some(c),
                     None => {
@@ -439,7 +450,11 @@ query SymphonyLinearPollNoProject($stateNames: [String!]!, $first: Int!, $relati
         let mut acc: Vec<Issue> = Vec::new();
 
         loop {
-            let variables = if self.project.as_deref().is_some_and(|p| !p.trim().is_empty()) {
+            let variables = if self
+                .project
+                .as_deref()
+                .is_some_and(|p| !p.trim().is_empty())
+            {
                 let slug = self.project.clone().unwrap();
                 json!({
                     "projectSlug": slug,
@@ -455,7 +470,11 @@ query SymphonyLinearPollNoProject($stateNames: [String!]!, $first: Int!, $relati
                 })
             };
 
-            let query = if self.project.as_deref().is_some_and(|p| !p.trim().is_empty()) {
+            let query = if self
+                .project
+                .as_deref()
+                .is_some_and(|p| !p.trim().is_empty())
+            {
                 r#"
 query SymphonyLinearIssuesProjectOnly($projectSlug: String!, $first: Int!, $relationFirst: Int!, $after: String) {
   issues(filter: { project: { slugId: { eq: $projectSlug } } }, first: $first, after: $after) {
@@ -529,11 +548,7 @@ query SymphonyLinearIssuesAll($first: Int!, $relationFirst: Int!, $after: String
             }
 
             if page.issues.page_info.has_next_page {
-                let cursor = page
-                    .issues
-                    .page_info
-                    .end_cursor
-                    .filter(|c| !c.is_empty());
+                let cursor = page.issues.page_info.end_cursor.filter(|c| !c.is_empty());
                 match cursor {
                     Some(c) => after = Some(c),
                     None => {
@@ -589,7 +604,8 @@ impl Tracker for LinearTracker {
         }
 
         // Terminal cleanup and similar paths must not apply assignee routing (matches Elixir).
-        self.fetch_issues_pages_with_state_filter(&normalized, None).await
+        self.fetch_issues_pages_with_state_filter(&normalized, None)
+            .await
     }
 
     async fn fetch_issue_states_by_ids(
@@ -639,6 +655,126 @@ query SymphonyLinearIssueStatesByIds($ids: [ID!]!, $first: Int!) {
         }
 
         Ok(out)
+    }
+
+    async fn create_comment(&self, issue_id: &str, body: &str) -> Result<(), TrackerError> {
+        let query = r#"
+mutation SymphonyCreateComment($issueId: String!, $body: String!) {
+  commentCreate(input: {issueId: $issueId, body: $body}) {
+    success
+  }
+}
+"#;
+        let variables = json!({
+            "issueId": issue_id,
+            "body": body,
+        });
+        #[derive(Deserialize)]
+        struct CommentCreateData {
+            #[serde(rename = "commentCreate")]
+            comment_create: SuccessPayload,
+        }
+        #[derive(Deserialize)]
+        struct SuccessPayload {
+            success: bool,
+        }
+        let data: CommentCreateData = self.graphql_json(query, variables).await?;
+        if data.comment_create.success {
+            Ok(())
+        } else {
+            Err(TrackerError::Request(
+                "linear_comment_create_failed".to_string(),
+            ))
+        }
+    }
+
+    async fn update_issue_state(
+        &self,
+        issue_id: &str,
+        state_name: &str,
+    ) -> Result<(), TrackerError> {
+        let state_id = self.resolve_state_id(issue_id, state_name).await?;
+        let query = r#"
+mutation SymphonyUpdateIssueState($issueId: String!, $stateId: String!) {
+  issueUpdate(id: $issueId, input: {stateId: $stateId}) {
+    success
+  }
+}
+"#;
+        let variables = json!({
+            "issueId": issue_id,
+            "stateId": state_id,
+        });
+        #[derive(Deserialize)]
+        struct IssueUpdateData {
+            #[serde(rename = "issueUpdate")]
+            issue_update: SuccessPayload,
+        }
+        #[derive(Deserialize)]
+        struct SuccessPayload {
+            success: bool,
+        }
+        let data: IssueUpdateData = self.graphql_json(query, variables).await?;
+        if data.issue_update.success {
+            Ok(())
+        } else {
+            Err(TrackerError::Request(
+                "linear_issue_update_failed".to_string(),
+            ))
+        }
+    }
+}
+
+impl LinearTracker {
+    async fn resolve_state_id(
+        &self,
+        issue_id: &str,
+        state_name: &str,
+    ) -> Result<String, TrackerError> {
+        let query = r#"
+query SymphonyResolveStateId($issueId: String!, $stateName: String!) {
+  issue(id: $issueId) {
+    team {
+      states(filter: {name: {eq: $stateName}}, first: 1) {
+        nodes {
+          id
+        }
+      }
+    }
+  }
+}
+"#;
+        let variables = json!({
+            "issueId": issue_id,
+            "stateName": state_name.trim(),
+        });
+        #[derive(Deserialize)]
+        struct StateLookupData {
+            issue: Option<IssueWithTeam>,
+        }
+        #[derive(Deserialize)]
+        struct IssueWithTeam {
+            team: LookupTeam,
+        }
+        #[derive(Deserialize)]
+        struct LookupTeam {
+            states: LookupStatesConn,
+        }
+        #[derive(Deserialize)]
+        struct LookupStatesConn {
+            nodes: Vec<LookupStateNode>,
+        }
+        #[derive(Deserialize)]
+        struct LookupStateNode {
+            id: String,
+        }
+        let data: StateLookupData = self.graphql_json(query, variables).await?;
+        let id = data
+            .issue
+            .and_then(|i| i.team.states.nodes.into_iter().next())
+            .map(|n| n.id)
+            .ok_or_else(|| TrackerError::Request("linear_state_not_found".to_string()))?;
+        Ok(id)
     }
 }
 
@@ -702,7 +838,11 @@ fn extract_blockers(inverse: &Option<InverseRelations>) -> Vec<String> {
             continue;
         }
         if let Some(issue) = &rel.issue {
-            if let Some(id) = issue.identifier.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty())
+            if let Some(id) = issue
+                .identifier
+                .as_ref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
             {
                 out.push(id.to_string());
             }
@@ -726,12 +866,7 @@ mod tests {
 
     #[test]
     fn dedupe_preserves_first_occurrence_order() {
-        let ids = vec![
-            "a".into(),
-            "b".into(),
-            "a".into(),
-            "c".into(),
-        ];
+        let ids = vec!["a".into(), "b".into(), "a".into(), "c".into()];
         assert_eq!(
             dedupe_preserve_order(&ids),
             vec!["a".to_string(), "b".to_string(), "c".to_string()]
