@@ -178,6 +178,9 @@ pub struct Orchestrator<T: Tracker> {
     seconds_running_bank: u64,
     retry_token_seq: u64,
     snapshot_publisher: Option<Arc<RwLock<OrchestratorSnapshot>>>,
+    /// Last absolute Codex usage snapshot attributed when an issue run finished (baseline for the next run).
+    /// Aligns global totals with Elixir-style marginal deltas when the same Codex thread spans retries.
+    issue_usage_floor: HashMap<String, Usage>,
     /// Live Codex/Cursor stream fields keyed by issue id (merged into [`OrchestratorSnapshot`] only).
     worker_live: Arc<Mutex<HashMap<String, WorkerLiveState>>>,
     /// Latest Codex-embedded rate limits map from stream (best effort).
@@ -211,6 +214,7 @@ impl<T: Tracker> Orchestrator<T> {
             seconds_running_bank: 0,
             retry_token_seq: 0,
             snapshot_publisher,
+            issue_usage_floor: HashMap::new(),
             worker_live: Arc::new(Mutex::new(HashMap::new())),
             rate_limits_live: Arc::new(Mutex::new(serde_json::json!({}))),
         })
@@ -259,10 +263,16 @@ impl<T: Tracker> Orchestrator<T> {
         let mut output_tokens = self.codex_completed_output;
         let mut total_tokens = self.codex_completed_total;
         for w in self.running.values() {
+            let floor = self
+                .issue_usage_floor
+                .get(&w.issue_id)
+                .cloned()
+                .unwrap_or_default();
             if let Some(u) = live.get(&w.issue_id).and_then(|x| x.usage_detail.as_ref()) {
-                input_tokens = input_tokens.saturating_add(u.input_tokens);
-                output_tokens = output_tokens.saturating_add(u.output_tokens);
-                total_tokens = total_tokens.saturating_add(u.total_tokens);
+                let m = u.saturating_sub(&floor);
+                input_tokens = input_tokens.saturating_add(m.input_tokens);
+                output_tokens = output_tokens.saturating_add(m.output_tokens);
+                total_tokens = total_tokens.saturating_add(m.total_tokens);
             }
         }
         CodexTotalsSnapshot {
@@ -435,26 +445,50 @@ impl<T: Tracker> Orchestrator<T> {
         };
         match completion.result {
             Ok(summary) => {
-                let usage_credit = summary.usage_breakdown.clone().or_else(|| {
-                    self.worker_live
-                        .lock()
-                        .unwrap()
-                        .get(&issue_id)
-                        .and_then(|w| w.usage_detail.clone())
-                });
+                let live_usage = self
+                    .worker_live
+                    .lock()
+                    .unwrap()
+                    .get(&issue_id)
+                    .and_then(|w| w.usage_detail.clone());
+                let usage_credit = match (summary.usage_breakdown.clone(), live_usage) {
+                    (Some(a), Some(b)) => Some(if a.total_tokens >= b.total_tokens {
+                        a
+                    } else {
+                        b
+                    }),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
+                let baseline = self
+                    .issue_usage_floor
+                    .get(&issue_id)
+                    .cloned()
+                    .unwrap_or_default();
                 if let Some(u) = usage_credit {
-                    self.total_tokens = self.total_tokens.saturating_add(u.total_tokens);
-                    self.codex_completed_input =
-                        self.codex_completed_input.saturating_add(u.input_tokens);
-                    self.codex_completed_output =
-                        self.codex_completed_output.saturating_add(u.output_tokens);
-                    self.codex_completed_total =
-                        self.codex_completed_total.saturating_add(u.total_tokens);
-                } else {
-                    self.total_tokens = self.total_tokens.saturating_add(summary.usage_tokens);
+                    let marginal = u.saturating_sub(&baseline);
+                    self.total_tokens = self.total_tokens.saturating_add(marginal.total_tokens);
+                    self.codex_completed_input = self
+                        .codex_completed_input
+                        .saturating_add(marginal.input_tokens);
+                    self.codex_completed_output = self
+                        .codex_completed_output
+                        .saturating_add(marginal.output_tokens);
                     self.codex_completed_total = self
                         .codex_completed_total
-                        .saturating_add(summary.usage_tokens);
+                        .saturating_add(marginal.total_tokens);
+                    self.issue_usage_floor.insert(issue_id.clone(), u);
+                } else {
+                    let marginal_total = summary.usage_tokens.saturating_sub(baseline.total_tokens);
+                    self.total_tokens = self.total_tokens.saturating_add(marginal_total);
+                    self.codex_completed_total =
+                        self.codex_completed_total.saturating_add(marginal_total);
+                    if summary.usage_tokens > baseline.total_tokens {
+                        let mut nu = baseline;
+                        nu.total_tokens = summary.usage_tokens;
+                        self.issue_usage_floor.insert(issue_id.clone(), nu);
+                    }
                 }
                 if let Some(worker) = self.running.get_mut(&summary.issue.id) {
                     worker.turns_completed = summary.turns_completed;
@@ -1006,7 +1040,8 @@ async fn run_issue_once(
                     "codex turn finished"
                 );
                 if let Some(usage) = turn.usage {
-                    usage_tokens = usage_tokens.saturating_add(usage.total_tokens);
+                    // Turn-completed usage is an absolute thread snapshot (cumulative), not a per-turn delta.
+                    usage_tokens = usage_tokens.max(usage.total_tokens);
                     last_usage_breakdown = Some(usage);
                 }
                 let status = turn.status.to_ascii_lowercase();
