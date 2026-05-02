@@ -38,11 +38,22 @@ pub enum CodexError {
     ApprovalRequired,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
+}
+
+impl Usage {
+    /// Component-wise saturating subtraction (for cumulative totals minus a per-issue floor).
+    pub fn saturating_sub(&self, floor: &Usage) -> Usage {
+        Usage {
+            input_tokens: self.input_tokens.saturating_sub(floor.input_tokens),
+            output_tokens: self.output_tokens.saturating_sub(floor.output_tokens),
+            total_tokens: self.total_tokens.saturating_sub(floor.total_tokens),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -742,11 +753,14 @@ fn failure_payload(message: &str) -> Value {
 fn apply_server_message(value: &Value, outcome: &mut TurnOutcome) -> bool {
     if let Some(params) = value.get("params") {
         maybe_extract_ids(params, outcome);
-        maybe_extract_usage(params, outcome);
+        if message_has_method(value, "turn/completed") {
+            if let Some(u) = turn_completed_usage_from_params(params) {
+                outcome.usage = Some(u);
+            }
+        }
     }
     if let Some(result) = value.get("result") {
         maybe_extract_ids(result, outcome);
-        maybe_extract_usage(result, outcome);
     }
     match value.get("method").and_then(|m| m.as_str()) {
         Some("turn/completed") => {
@@ -764,11 +778,9 @@ fn apply_server_message(value: &Value, outcome: &mut TurnOutcome) -> bool {
 fn apply_cursor_translated_message(value: &Value, outcome: &mut TurnOutcome) {
     if let Some(params) = value.get("params") {
         maybe_extract_ids(params, outcome);
-        maybe_extract_usage(params, outcome);
     }
     if let Some(result) = value.get("result") {
         maybe_extract_ids(result, outcome);
-        maybe_extract_usage(result, outcome);
     }
     match value.get("type").and_then(Value::as_str) {
         Some("error") => outcome.status = "failed".to_string(),
@@ -783,7 +795,10 @@ fn apply_cursor_translated_message(value: &Value, outcome: &mut TurnOutcome) {
             } else {
                 "completed".to_string()
             };
-            maybe_extract_usage(value, outcome);
+            if outcome.usage.is_none() {
+                outcome.usage = extract_absolute_usage_from_stream_message(value)
+                    .or_else(|| value.get("usage").map(|u| parse_usage_object(u)));
+            }
         }
         Some("assistant")
         | Some("tool_call")
@@ -796,7 +811,11 @@ fn apply_cursor_translated_message(value: &Value, outcome: &mut TurnOutcome) {
                 outcome.status = "in_progress".to_string();
             }
         }
-        Some("turn.completed") => outcome.status = "completed".to_string(),
+        Some("turn.completed") => {
+            outcome.status = "completed".to_string();
+            outcome.usage = extract_absolute_usage_from_stream_message(value)
+                .or_else(|| value.get("usage").map(|u| parse_usage_object(u)));
+        }
         _ => {
             if apply_server_message(value, outcome) {
                 return;
@@ -851,25 +870,77 @@ fn parse_usage_object(usage: &Value) -> Usage {
     }
 }
 
-fn usage_from_src(src: &Value) -> Option<Usage> {
-    let usage = src.get("usage").or_else(|| src.get("total_token_usage"))?;
+/// Absolute cumulative usage maps only (see `elixir/docs/token_accounting.md`).
+/// Never uses `last_token_usage` / `tokenUsage.last` for totals.
+fn absolute_usage_from_map(src: &Value) -> Option<Usage> {
+    let usage = src
+        .get("total_token_usage")
+        .or_else(|| src.get("totalTokenUsage"))?;
     Some(parse_usage_object(usage))
 }
 
-/// Best-effort token usage from any app-server/Cursor JSON line (checks `params`, `result`, and root).
-pub fn extract_usage_from_stream_message(value: &Value) -> Option<Usage> {
-    value
-        .get("params")
-        .and_then(usage_from_src)
-        .or_else(|| value.get("result").and_then(usage_from_src))
-        .or_else(|| usage_from_src(value))
+fn absolute_usage_from_token_usage_total(src: &Value) -> Option<Usage> {
+    let total = src.get("tokenUsage")?.get("total")?;
+    Some(parse_usage_object(total))
 }
 
-fn maybe_extract_usage(src: &Value, outcome: &mut TurnOutcome) {
-    let Some(parsed) = usage_from_src(src) else {
-        return;
-    };
-    outcome.usage = Some(parsed);
+fn path_absolute_usage_msg_payload<'a>(v: &'a Value) -> Option<&'a Value> {
+    v.get("msg")?
+        .get("payload")?
+        .get("info")?
+        .get("total_token_usage")
+}
+
+fn path_absolute_usage_msg_info<'a>(v: &'a Value) -> Option<&'a Value> {
+    v.get("msg")?.get("info")?.get("total_token_usage")
+}
+
+/// Prefer Codex absolute totals in the same order as Elixir `absolute_token_usage_from_payload/1`.
+fn absolute_usage_from_container(container: &Value) -> Option<Usage> {
+    if let Some(u) = path_absolute_usage_msg_payload(container)
+        .or_else(|| path_absolute_usage_msg_info(container))
+    {
+        return Some(parse_usage_object(u));
+    }
+    if let Some(u) = absolute_usage_from_token_usage_total(container) {
+        return Some(u);
+    }
+    absolute_usage_from_map(container)
+}
+
+/// True when `value` is a JSON-RPC notification with the given `method`.
+fn message_has_method(value: &Value, method: &str) -> bool {
+    value
+        .get("method")
+        .and_then(Value::as_str)
+        .is_some_and(|m| m == method)
+}
+
+/// Authoritative live totals from the app-server stream (not turn-completed snapshots).
+pub fn extract_absolute_usage_from_stream_message(value: &Value) -> Option<Usage> {
+    let from_params = value.get("params").and_then(absolute_usage_from_container);
+    if from_params.is_some() {
+        return from_params;
+    }
+    let from_result = value.get("result").and_then(absolute_usage_from_container);
+    if from_result.is_some() {
+        return from_result;
+    }
+    absolute_usage_from_container(value)
+}
+
+fn turn_completed_usage_from_params(params: &Value) -> Option<Usage> {
+    let usage = params
+        .get("usage")
+        .or_else(|| params.get("total_token_usage"))?;
+    Some(parse_usage_object(usage))
+}
+
+/// Best-effort token usage from any app-server/Cursor JSON line for **live** accounting.
+/// Uses absolute cumulative snapshots only; ignores deltas and generic `usage` except `turn/completed`
+/// (handled separately for [`TurnOutcome`]).
+pub fn extract_usage_from_stream_message(value: &Value) -> Option<Usage> {
+    extract_absolute_usage_from_stream_message(value)
 }
 
 /// Best-effort Codex thread/session id from a stream JSON line (params/result/root).
@@ -1027,6 +1098,87 @@ mod tests {
             extract_thread_id_from_stream_message(&msg).as_deref(),
             Some("thr_stream")
         );
+    }
+
+    #[test]
+    fn extract_absolute_prefers_total_token_usage_in_token_count_payload() {
+        let msg = json!({
+            "method": "codex/event/token_count",
+            "params": {
+                "msg": {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 2,
+                                "output_tokens": 1,
+                                "total_tokens": 3
+                            },
+                            "total_token_usage": {
+                                "input_tokens": 200,
+                                "output_tokens": 100,
+                                "total_tokens": 300
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let u = extract_absolute_usage_from_stream_message(&msg).expect("usage");
+        assert_eq!(u.input_tokens, 200);
+        assert_eq!(u.output_tokens, 100);
+        assert_eq!(u.total_tokens, 300);
+    }
+
+    #[test]
+    fn extract_absolute_prefers_token_usage_total_for_thread_notification() {
+        let msg = json!({
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "tokenUsage": {
+                    "total": {"input_tokens": 10, "output_tokens": 4, "total_tokens": 14},
+                    "last": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3}
+                }
+            }
+        });
+        let u = extract_absolute_usage_from_stream_message(&msg).expect("usage");
+        assert_eq!(u.total_tokens, 14);
+    }
+
+    #[test]
+    fn extract_absolute_ignores_last_only_token_count() {
+        let msg = json!({
+            "method": "codex/event/token_count",
+            "params": {
+                "msg": {
+                    "payload": {
+                        "info": {
+                            "last_token_usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+                        }
+                    }
+                }
+            }
+        });
+        assert!(extract_absolute_usage_from_stream_message(&msg).is_none());
+    }
+
+    #[test]
+    fn usage_saturating_sub_marginal() {
+        let cur = Usage {
+            input_tokens: 200,
+            output_tokens: 100,
+            total_tokens: 300,
+        };
+        let floor = Usage {
+            input_tokens: 150,
+            output_tokens: 90,
+            total_tokens: 240,
+        };
+        let m = cur.saturating_sub(&floor);
+        assert_eq!(m.input_tokens, 50);
+        assert_eq!(m.output_tokens, 10);
+        assert_eq!(m.total_tokens, 60);
     }
 
     #[test]
