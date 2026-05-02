@@ -200,6 +200,9 @@ mod tests {
                     turns_completed: 1,
                     attempt: 1,
                     stall_restarts: 0,
+                    process_id: None,
+                    usage_tokens_this_run: 0,
+                    current_step: String::new(),
                 }],
                 retrying: vec![RetrySnapshot {
                     issue_id: "i2".into(),

@@ -11,6 +11,9 @@ use tokio::process::{Child, Command};
 use tokio::time::{Duration, Instant, timeout};
 use tracing::{debug, info, warn};
 
+/// Called for each parsed JSON line from Codex/Cursor stdout (app-server protocol).
+pub type TurnStreamObserver = std::sync::Arc<dyn Fn(&Value) + Send + Sync>;
+
 #[derive(Debug, Error)]
 pub enum CodexError {
     #[error("spawn failed: {0}")]
@@ -168,6 +171,10 @@ pub struct CursorCliClient {
 }
 
 impl CodexClient {
+    /// OS process id of the shell child running Codex, when available.
+    pub fn child_pid(&self) -> Option<u32> {
+        self.child.id()
+    }
     pub async fn spawn(command: &str, cwd: &std::path::Path) -> Result<Self, CodexError> {
         let child = Command::new("bash")
             .arg("-lc")
@@ -192,6 +199,7 @@ impl CodexClient {
         tool_context: DynamicToolContext,
         policies: CodexSessionPolicies,
         detailed_app_server_logs: bool,
+        stream_observer: Option<TurnStreamObserver>,
     ) -> Result<TurnOutcome, CodexError> {
         let auto_approve_incoming_requests = matches!(
             &policies.approval_policy,
@@ -268,6 +276,9 @@ impl CodexClient {
                     debug!("codex stream non-json line ignored");
                     continue;
                 };
+                if let Some(obs) = stream_observer.as_ref() {
+                    obs(&value);
+                }
                 if detailed_app_server_logs {
                     let raw = serde_json::to_string(&value).unwrap_or_else(|_| line.clone());
                     let preview: String = raw.chars().take(2000).collect();
@@ -375,6 +386,11 @@ impl CodexClient {
 }
 
 impl CursorCliClient {
+    /// OS process id of the shell child running Cursor CLI, when available.
+    pub fn child_pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
     pub async fn spawn(
         command: &str,
         prompt: &str,
@@ -405,6 +421,7 @@ impl CursorCliClient {
         tool_context: DynamicToolContext,
         policies: CodexSessionPolicies,
         detailed_app_server_logs: bool,
+        stream_observer: Option<TurnStreamObserver>,
     ) -> Result<TurnOutcome, CodexError> {
         let auto_approve_incoming_requests = matches!(
             &policies.approval_policy,
@@ -479,6 +496,9 @@ impl CursorCliClient {
                     }
                     continue;
                 };
+                if let Some(obs) = stream_observer.as_ref() {
+                    obs(&value);
+                }
                 after_first_json = true;
                 if detailed_app_server_logs {
                     let raw_message = serde_json::to_string(&value).unwrap_or_else(|_| line.clone());
@@ -814,10 +834,7 @@ fn maybe_extract_ids(src: &Value, outcome: &mut TurnOutcome) {
     }
 }
 
-fn maybe_extract_usage(src: &Value, outcome: &mut TurnOutcome) {
-    let Some(usage) = src.get("usage").or_else(|| src.get("total_token_usage")) else {
-        return;
-    };
+fn parse_usage_object(usage: &Value) -> Usage {
     let input_tokens = usage
         .get("input_tokens")
         .or_else(|| usage.get("inputTokens"))
@@ -833,11 +850,65 @@ fn maybe_extract_usage(src: &Value, outcome: &mut TurnOutcome) {
         .or_else(|| usage.get("totalTokens"))
         .and_then(|v| v.as_u64())
         .unwrap_or(input_tokens.saturating_add(output_tokens));
-    outcome.usage = Some(Usage {
+    Usage {
         input_tokens,
         output_tokens,
         total_tokens,
-    });
+    }
+}
+
+fn usage_from_src(src: &Value) -> Option<Usage> {
+    let usage = src.get("usage").or_else(|| src.get("total_token_usage"))?;
+    Some(parse_usage_object(usage))
+}
+
+/// Best-effort token usage from any app-server/Cursor JSON line (checks `params`, `result`, and root).
+pub fn extract_usage_from_stream_message(value: &Value) -> Option<Usage> {
+    value
+        .get("params")
+        .and_then(usage_from_src)
+        .or_else(|| value.get("result").and_then(usage_from_src))
+        .or_else(|| usage_from_src(value))
+}
+
+fn maybe_extract_usage(src: &Value, outcome: &mut TurnOutcome) {
+    let Some(parsed) = usage_from_src(src) else {
+        return;
+    };
+    outcome.usage = Some(parsed);
+}
+
+/// Human-readable "current step" from an app-server or Cursor-stream JSON line (for dashboards).
+pub fn summarize_turn_stream_message(value: &Value) -> Option<String> {
+    if let Some(method) = value.get("method").and_then(Value::as_str) {
+        if maybe_tool_call_id(value).is_some() {
+            if let Some((tool_name, _)) = extract_tool_call(value) {
+                return Some(format!("{method} ({tool_name})"));
+            }
+        }
+        return Some(method.to_string());
+    }
+
+    match value.get("type").and_then(Value::as_str) {
+        Some("turn.delta") => None,
+        Some(
+            typ @ ("assistant"
+            | "tool_call"
+            | "tool_result"
+            | "turn.started"
+            | "turn.tool_call"
+            | "turn.tool_result"
+            | "turn.completed"),
+        ) => Some(typ.to_string()),
+        Some("result") => value
+            .get("subtype")
+            .or_else(|| value.get("sub_type"))
+            .and_then(Value::as_str)
+            .map(|s| format!("result:{s}"))
+            .or_else(|| Some("result".to_string())),
+        Some("error") => Some("error".to_string()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

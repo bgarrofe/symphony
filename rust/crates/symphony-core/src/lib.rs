@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
@@ -31,6 +32,12 @@ pub struct RunningWorker {
     pub turns_completed: u32,
     pub attempt: u32,
     pub stall_restarts: u32,
+    /// Child shell PID running Codex / Cursor CLI, when reported by the host OS.
+    pub process_id: Option<u32>,
+    /// Latest cumulative model token usage for the in-flight turn/run (from app-server stream).
+    pub usage_tokens_this_run: u64,
+    /// Last meaningful app-server / stream event (mirrors detailed JSON-RPC or stream `type`).
+    pub current_step: String,
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +105,13 @@ pub enum CoreError {
     Runtime(String),
 }
 
+#[derive(Debug, Default, Clone)]
+struct WorkerLiveState {
+    process_id: Option<u32>,
+    usage_tokens: u64,
+    current_step: String,
+}
+
 pub struct Orchestrator<T: Tracker> {
     settings: Settings,
     tracker: T,
@@ -111,6 +125,8 @@ pub struct Orchestrator<T: Tracker> {
     total_tokens: u64,
     retry_token_seq: u64,
     snapshot_publisher: Option<Arc<RwLock<OrchestratorSnapshot>>>,
+    /// Live Codex/Cursor stream fields keyed by issue id (merged into [`OrchestratorSnapshot`] only).
+    worker_live: Arc<Mutex<HashMap<String, WorkerLiveState>>>,
 }
 
 impl<T: Tracker> Orchestrator<T> {
@@ -135,12 +151,24 @@ impl<T: Tracker> Orchestrator<T> {
             total_tokens: 0,
             retry_token_seq: 0,
             snapshot_publisher,
+            worker_live: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
+    fn drop_worker_live(&self, issue_id: &str) {
+        let _ = self.worker_live.lock().unwrap().remove(issue_id);
+    }
+
     pub fn snapshot(&self) -> OrchestratorSnapshot {
+        let live = self.worker_live.lock().unwrap();
+        let running: Vec<RunningWorker> = self
+            .running
+            .values()
+            .cloned()
+            .map(|w| merge_running_worker_live(w, &live))
+            .collect();
         OrchestratorSnapshot {
-            running: self.running.values().cloned().collect(),
+            running,
             retrying: self
                 .retries
                 .iter()
@@ -229,6 +257,9 @@ impl<T: Tracker> Orchestrator<T> {
                     turns_completed: 0,
                     attempt: retry_attempt,
                     stall_restarts: retry_attempt.saturating_sub(1),
+                    process_id: None,
+                    usage_tokens_this_run: 0,
+                    current_step: String::new(),
                 },
             );
             self.spawn_issue_run(issue, retry_attempt);
@@ -244,8 +275,9 @@ impl<T: Tracker> Orchestrator<T> {
         let settings = self.settings.clone();
         let workflow_store = self.workflow_store.clone();
         let issue_id = issue.id.clone();
+        let worker_live = self.worker_live.clone();
         let handle = tokio::spawn(async move {
-            run_issue_once(settings, workflow_store, issue, retry_attempt).await
+            run_issue_once(settings, workflow_store, issue, retry_attempt, worker_live).await
         });
         self.run_tasks.insert(issue_id, handle);
     }
@@ -313,6 +345,7 @@ impl<T: Tracker> Orchestrator<T> {
         }
         self.running.remove(&issue_id);
         self.claimed.remove(&issue_id);
+        self.drop_worker_live(&issue_id);
     }
 
     fn reconcile_retries(&mut self) {
@@ -460,6 +493,7 @@ impl<T: Tracker> Orchestrator<T> {
                 );
                 self.enqueue_stall_retry(&issue, worker.worker_host.clone(), Some(reason));
                 self.claimed.remove(&issue_id);
+                self.drop_worker_live(&issue_id);
             }
         }
     }
@@ -471,6 +505,14 @@ impl<T: Tracker> Orchestrator<T> {
         let ids: Vec<String> = self.running.keys().cloned().collect();
         let states = self.tracker.fetch_issue_states_by_ids(&ids).await?;
         let by_id: HashMap<String, String> = states.into_iter().map(|s| (s.id, s.state)).collect();
+
+        // Keep snapshot/TUI in sync with the tracker (e.g. Todo → In Progress when the agent starts).
+        for (issue_id, worker) in self.running.iter_mut() {
+            if let Some(state) = by_id.get(issue_id) {
+                worker.issue_state = state.clone();
+            }
+        }
+
         let stale_ids: Vec<String> = self
             .running
             .keys()
@@ -489,6 +531,7 @@ impl<T: Tracker> Orchestrator<T> {
             if let Some(worker) = self.running.remove(&issue_id) {
                 info!(issue=%worker.issue_identifier, "reconciled running issue no longer active");
                 self.claimed.remove(&issue_id);
+                self.drop_worker_live(&issue_id);
                 self.cleanup_workspace_with_hooks(&worker.workspace_path)
                     .await?;
             }
@@ -637,6 +680,22 @@ fn retry_entry_to_snapshot(issue_id: &str, entry: &RetryEntry) -> RetrySnapshot 
     }
 }
 
+fn merge_running_worker_live(
+    mut worker: RunningWorker,
+    live: &HashMap<String, WorkerLiveState>,
+) -> RunningWorker {
+    if let Some(s) = live.get(&worker.issue_id) {
+        if s.process_id.is_some() {
+            worker.process_id = s.process_id;
+        }
+        worker.usage_tokens_this_run = s.usage_tokens;
+        if !s.current_step.is_empty() {
+            worker.current_step = s.current_step.clone();
+        }
+    }
+    worker
+}
+
 fn issue_from_running_worker(worker: &RunningWorker) -> Issue {
     Issue {
         id: worker.issue_id.clone(),
@@ -670,6 +729,7 @@ async fn run_issue_once(
     workflow_store: WorkflowStore,
     issue: Issue,
     attempt: u32,
+    worker_live: Arc<Mutex<HashMap<String, WorkerLiveState>>>,
 ) -> Result<IssueRunSummary, CoreError> {
     info!(issue=%issue.identifier, "starting issue run");
     let workspace_root = PathBuf::from(&settings.workspace.root);
@@ -760,7 +820,15 @@ async fn run_issue_once(
             },
         };
 
-        let turn = execute_turn(&settings, &workspace_path, &issue, &rendered, tool_context).await;
+        let turn = execute_turn(
+            &settings,
+            &workspace_path,
+            &issue,
+            &rendered,
+            tool_context,
+            worker_live.clone(),
+        )
+        .await;
         match turn {
             Ok(turn) => {
                 turns_completed = turns_completed.saturating_add(1);
@@ -818,12 +886,31 @@ async fn run_issue_once(
     })
 }
 
+fn codex_stream_observer(
+    issue_id: String,
+    worker_live: Arc<Mutex<HashMap<String, WorkerLiveState>>>,
+) -> Option<symphony_codex::TurnStreamObserver> {
+    Some(Arc::new(move |value: &serde_json::Value| {
+        let Ok(mut guard) = worker_live.lock() else {
+            return;
+        };
+        let row = guard.entry(issue_id.clone()).or_default();
+        if let Some(u) = symphony_codex::extract_usage_from_stream_message(value) {
+            row.usage_tokens = row.usage_tokens.max(u.total_tokens);
+        }
+        if let Some(step) = symphony_codex::summarize_turn_stream_message(value) {
+            row.current_step = step;
+        }
+    }))
+}
+
 async fn execute_turn(
     settings: &Settings,
     workspace_path: &PathBuf,
     issue: &Issue,
     rendered: &str,
     tool_context: DynamicToolContext,
+    worker_live: Arc<Mutex<HashMap<String, WorkerLiveState>>>,
 ) -> Result<symphony_codex::TurnOutcome, CoreError> {
     let cwd = workspace_path.display().to_string();
     let policies = CodexSessionPolicies {
@@ -832,6 +919,7 @@ async fn execute_turn(
         turn_sandbox_policy: settings.codex.turn_sandbox_policy.clone(),
     };
     let turn_title = Some(format!("{}: {}", issue.identifier, issue.title));
+    let stream_observer = codex_stream_observer(issue.id.clone(), worker_live.clone());
     if settings
         .runtime
         .interface
@@ -840,6 +928,11 @@ async fn execute_turn(
         let mut client = CursorCliClient::spawn(&settings.codex.command, rendered, workspace_path)
             .await
             .map_err(|e| CoreError::Runtime(e.to_string()))?;
+        if let Some(pid) = client.child_pid() {
+            if let Ok(mut g) = worker_live.lock() {
+                g.entry(issue.id.clone()).or_default().process_id = Some(pid);
+            }
+        }
         info!(issue=%issue.identifier, runtime="cursor_cli", "cursor cli process spawned");
         let turn = client
             .initialize(
@@ -851,6 +944,7 @@ async fn execute_turn(
                 tool_context,
                 policies.clone(),
                 settings.codex.detailed_app_server_logs,
+                stream_observer,
             )
             .await
             .map_err(|e| CoreError::Runtime(e.to_string()))?;
@@ -860,6 +954,11 @@ async fn execute_turn(
         let mut client = CodexClient::spawn(&settings.codex.command, workspace_path)
             .await
             .map_err(|e| CoreError::Runtime(e.to_string()))?;
+        if let Some(pid) = client.child_pid() {
+            if let Ok(mut g) = worker_live.lock() {
+                g.entry(issue.id.clone()).or_default().process_id = Some(pid);
+            }
+        }
         info!(issue=%issue.identifier, runtime="codex", "codex process spawned");
         let turn = client
             .initialize(
@@ -872,6 +971,7 @@ async fn execute_turn(
                 tool_context,
                 policies,
                 settings.codex.detailed_app_server_logs,
+                stream_observer,
             )
             .await
             .map_err(|e| CoreError::Runtime(e.to_string()))?;
@@ -1183,6 +1283,9 @@ mod tests {
                 turns_completed: 0,
                 attempt: 1,
                 stall_restarts: 0,
+                process_id: None,
+                usage_tokens_this_run: 0,
+                current_step: String::new(),
             },
         );
         orch.claimed.insert(issue.id.clone());
@@ -1234,6 +1337,9 @@ mod tests {
                 turns_completed: 0,
                 attempt: 1,
                 stall_restarts: 0,
+                process_id: None,
+                usage_tokens_this_run: 0,
+                current_step: String::new(),
             },
         );
         orch.claimed.insert(issue.id.clone());
@@ -1282,6 +1388,9 @@ mod tests {
                 turns_completed: 0,
                 attempt: 1,
                 stall_restarts: 0,
+                process_id: None,
+                usage_tokens_this_run: 0,
+                current_step: String::new(),
             },
         );
         orch.claimed.insert(issue.id.clone());
@@ -1334,6 +1443,9 @@ mod tests {
                 turns_completed: 0,
                 attempt: 1,
                 stall_restarts: 0,
+                process_id: None,
+                usage_tokens_this_run: 0,
+                current_step: String::new(),
             },
         );
         orch.claimed.insert("reconcile".to_string());
