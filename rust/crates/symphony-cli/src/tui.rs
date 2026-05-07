@@ -18,7 +18,7 @@ use ratatui::{
 use std::io::{self};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use symphony_core::{OrchestratorSnapshot, RetrySnapshot, RunningWorker};
+use symphony_core::{CodexTotalsSnapshot, OrchestratorSnapshot, RetrySnapshot, RunningWorker};
 use tokio::sync::{Notify, RwLock};
 
 const BG: Color = Color::Rgb(30, 32, 38);
@@ -110,23 +110,13 @@ struct Agent {
 
 struct AnimationState {
     table_state: TableState,
-    tick: u64,
-    throughput: u64,
-    tokens_in: u64,
-    tokens_out: u64,
 }
 
 impl AnimationState {
     fn new() -> Self {
         let mut table_state = TableState::default();
         table_state.select(Some(0));
-        Self {
-            table_state,
-            tick: 0,
-            throughput: 658_875,
-            tokens_in: 38_183_882,
-            tokens_out: 368_361,
-        }
+        Self { table_state }
     }
 
     fn next_row(&mut self, row_count: usize) {
@@ -148,13 +138,6 @@ impl AnimationState {
         }
         let i = self.table_state.selected().unwrap_or(0).saturating_sub(1);
         self.table_state.select(Some(i));
-    }
-
-    fn on_tick(&mut self) {
-        self.tick += 1;
-        self.throughput = 658_875_u64.saturating_add((self.tick % 7) * 150);
-        self.tokens_in += 12_000;
-        self.tokens_out += 500;
     }
 
     fn clamp_selection(&mut self, row_count: usize) {
@@ -257,10 +240,8 @@ pub async fn run_tui(
     terminal.clear()?;
 
     let poll_interval = Duration::from_millis(ctx.poll_interval_ms.max(100));
-    let tick_rate = Duration::from_millis(ctx.refresh_ms.max(100));
     let mut next_pull_deadline = Instant::now() + poll_interval;
     let mut anim = AnimationState::new();
-    let mut last_anim_tick = Instant::now();
 
     let result = async {
         loop {
@@ -282,6 +263,7 @@ pub async fn run_tui(
                     &ctx,
                     &agents,
                     &snap.retrying,
+                    &snap.codex_totals,
                     &mut anim,
                     next_refresh_secs,
                 )
@@ -290,7 +272,7 @@ pub async fn run_tui(
             tokio::select! {
                 biased;
                 _ = shutdown.notified() => break,
-                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                _ = tokio::time::sleep(Duration::from_millis(ctx.refresh_ms.max(50))) => {}
             }
 
             while event::poll(Duration::ZERO)? {
@@ -307,16 +289,10 @@ pub async fn run_tui(
                             }
                             KeyCode::Down | KeyCode::Char('j') => anim.next_row(table_row_count),
                             KeyCode::Up | KeyCode::Char('k') => anim.prev_row(table_row_count),
-                            KeyCode::Char('r') => anim.on_tick(),
                             _ => {}
                         }
                     }
                 }
-            }
-
-            if last_anim_tick.elapsed() >= tick_rate {
-                anim.on_tick();
-                last_anim_tick = Instant::now();
             }
         }
         Ok::<(), anyhow::Error>(())
@@ -350,6 +326,7 @@ fn draw(
     ctx: &TuiContext,
     agents: &[Agent],
     retries: &[RetrySnapshot],
+    codex_totals: &CodexTotalsSnapshot,
     anim: &mut AnimationState,
     next_refresh_secs: u64,
 ) {
@@ -366,17 +343,22 @@ fn draw(
         ])
         .split(area);
 
-    draw_status(f, ctx, agents, anim, chunks[0], next_refresh_secs);
+    draw_status(f, ctx, agents, codex_totals, chunks[0], next_refresh_secs);
     draw_table(f, agents, anim, chunks[1]);
     draw_backoff(f, retries, chunks[2]);
     draw_help(f, chunks[3]);
+}
+
+fn throughput_tps(codex_totals: &CodexTotalsSnapshot, elapsed_secs: u64) -> u64 {
+    let denom = elapsed_secs.max(1);
+    codex_totals.total_tokens / denom
 }
 
 fn draw_status(
     f: &mut Frame,
     ctx: &TuiContext,
     agents: &[Agent],
-    anim: &AnimationState,
+    codex_totals: &CodexTotalsSnapshot,
     area: Rect,
     next_refresh_secs: u64,
 ) {
@@ -388,6 +370,7 @@ fn draw_status(
     let cs = Style::default().fg(CYAN);
 
     let secs = ctx.started_at.elapsed().as_secs();
+    let tps = throughput_tps(codex_totals, secs);
     let elapsed = format!("{}m {}s", secs / 60, secs % 60);
     let project = ctx.project_url.as_deref().unwrap_or("[no project URL]");
 
@@ -417,7 +400,7 @@ fn draw_status(
         },
         Line::from(vec![
             Span::styled("Throughput:  ", lb),
-            Span::styled(format!("{} tps", format_num(anim.throughput)), vs),
+            Span::styled(format!("{} tps", format_num(tps)), vs),
         ]),
         Line::from(vec![
             Span::styled("Runtime:     ", lb),
@@ -426,11 +409,11 @@ fn draw_status(
         Line::from(vec![
             Span::styled("Tokens:      ", lb),
             Span::styled("in ", ds),
-            Span::styled(format_num(anim.tokens_in), cs),
+            Span::styled(format_num(codex_totals.input_tokens), cs),
             Span::styled(" | out ", ds),
-            Span::styled(format_num(anim.tokens_out), cs),
+            Span::styled(format_num(codex_totals.output_tokens), cs),
             Span::styled(" | total ", ds),
-            Span::styled(format_num(anim.tokens_in + anim.tokens_out), cs),
+            Span::styled(format_num(codex_totals.total_tokens), cs),
         ]),
         Line::from(vec![
             Span::styled("Rate Limits: ", lb),
@@ -575,9 +558,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ),
         Span::styled("navigate   ", Style::default().fg(DIM)),
         Span::styled("q ", Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
-        Span::styled("quit   ", Style::default().fg(DIM)),
-        Span::styled("r ", Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
-        Span::styled("force refresh", Style::default().fg(DIM)),
+        Span::styled("quit", Style::default().fg(DIM)),
     ]);
     f.render_widget(
         Paragraph::new(line).style(Style::default().bg(Color::Rgb(25, 27, 32))),
